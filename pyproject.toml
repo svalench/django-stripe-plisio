@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-stripe-plisio"
+version = "0.1.0"
+description = "Reusable Django billing package for Stripe and Plisio payments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "django-stripe-plisio contributors" }]
+dependencies = [
+    "Django>=5.0",
+    "requests>=2.31",
+    "stripe>=8.0",
+]
+
+[project.optional-dependencies]
+api = ["djangorestframework>=3.15"]
+celery = ["celery>=5.3", "redis>=5.0"]
+dev = [
+    "django-stripe-plisio[api]",
+    "build>=1.2",
+    "mypy>=1.11",
+    "ruff>=0.6",
+    "pytest>=8.0",
+    "pytest-django>=4.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/django-stripe-plisio"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"django_stripe_plisio.billing" = ["migrations/*.py"]
+"django_stripe_plisio.payments" = ["migrations/*.py"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "demo_project.settings"
+pythonpath = ["src", "demo_project"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/migrations/*.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["django_stripe_plisio"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "django_stripe_plisio.*.models"
+disable_error_code = ["var-annotated", "misc", "attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "django_stripe_plisio.*.migrations.*"
+ignore_errors = true
