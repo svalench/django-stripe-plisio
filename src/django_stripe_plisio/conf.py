@@ -29,6 +29,14 @@ class PackageSettings:
         return _get(f"{cls.PREFIX}PLISIO_CALLBACK_SECRET", "") or ""
 
     @classmethod
+    def plisio_webhook_url(cls) -> str:
+        return _get(f"{cls.PREFIX}PLISIO_WEBHOOK_URL", "") or ""
+
+    @classmethod
+    def require_webhook_secret(cls) -> bool:
+        return bool(_get(f"{cls.PREFIX}REQUIRE_WEBHOOK_SECRET", True))
+
+    @classmethod
     def default_currency(cls) -> str:
         return (_get(f"{cls.PREFIX}DEFAULT_CURRENCY", "USD") or "USD").upper()
 
@@ -53,4 +61,10 @@ class PackageSettings:
 
     @classmethod
     def url_prefix(cls) -> str:
+        """Префикс mount point в проекте-потребителе (только документация)."""
         return _get(f"{cls.PREFIX}URL_PREFIX", "billing") or "billing"
+
+    @classmethod
+    def invoice_pending_ttl_hours(cls) -> int | None:
+        """Через сколько часов pending-счёт истекает (None — не истекает автоматически)."""
+        return _get(f"{cls.PREFIX}INVOICE_PENDING_TTL_HOURS", None)

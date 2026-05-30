@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 from urllib.parse import urlencode
 
 import requests
+from django.db import transaction
 from django.utils import timezone
 
 from django_stripe_plisio.billing.enums import PaymentProvider
 from django_stripe_plisio.billing.models import Invoice
+from django_stripe_plisio.billing.money import minor_to_major_amount
 from django_stripe_plisio.billing.services import mark_invoice_paid
 from django_stripe_plisio.conf import PackageSettings
+from django_stripe_plisio.exceptions import WebhookVerificationError
 from django_stripe_plisio.payments.enums import PaymentAttemptStatus, WebhookProcessingStatus
 from django_stripe_plisio.payments.models import PaymentAttempt, ProviderTransaction, WebhookEvent
 from django_stripe_plisio.payments.services.base import BasePaymentProvider
 from django_stripe_plisio.signals import payment_failed
+
+logger = logging.getLogger(__name__)
 
 PLISIO_API_URL = "https://api.plisio.net/api/v1"
 
@@ -35,8 +41,10 @@ class PlisioPaymentService(BasePaymentProvider):
             status=PaymentAttemptStatus.CREATED,
         )
 
-        # Сумма для Plisio в основных единицах (API ожидает decimal string)
-        amount = f"{invoice.total_minor / 100:.2f}"
+        amount = minor_to_major_amount(invoice.total_minor, invoice.currency)
+        callback_url = PackageSettings.plisio_webhook_url()
+        if not callback_url:
+            raise ValueError("DJANGO_STRIPE_PLISIO_PLISIO_WEBHOOK_URL is not configured")
 
         params: dict[str, Any] = {
             "api_key": self._api_key(),
@@ -44,8 +52,12 @@ class PlisioPaymentService(BasePaymentProvider):
             "source_amount": amount,
             "order_number": str(invoice.pk),
             "order_name": f"Invoice {invoice.pk}",
-            "callback_url": PackageSettings.success_url() or "",
+            "callback_url": callback_url,
         }
+
+        success_url = PackageSettings.success_url()
+        if success_url:
+            params["success_callback_url"] = success_url
 
         attempt.request_payload = {k: v for k, v in params.items() if k != "api_key"}
 
@@ -88,22 +100,35 @@ class PlisioPaymentService(BasePaymentProvider):
         return attempt
 
     def verify_webhook(self, payload: bytes, headers: dict[str, str]) -> dict:
-        data = json.loads(payload) if isinstance(payload, (bytes, str)) else payload
-        if isinstance(data, bytes):
-            data = json.loads(data.decode())
-        if isinstance(payload, bytes) and not isinstance(data, dict):
-            data = json.loads(payload.decode())
+        data = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        return self._verify_plisio_data(data)
 
-        verify_hash = data.pop("verify_hash", None)
+    def verify_webhook_from_post(self, post_data: dict[str, Any]) -> dict:
+        """Проверка callback из application/x-www-form-urlencoded."""
+        data = {k: post_data[k] for k in post_data}
+        return self._verify_plisio_data(data)
+
+    def _verify_plisio_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(data)
+        verify_hash = payload.pop("verify_hash", None)
         secret = PackageSettings.plisio_callback_secret()
+
+        if PackageSettings.require_webhook_secret():
+            if not secret:
+                raise WebhookVerificationError("PLISIO_CALLBACK_SECRET is not configured")
+            if not verify_hash:
+                raise WebhookVerificationError("Missing Plisio verify_hash")
+
         if secret and verify_hash:
-            ordered = sorted(data.items())
+            ordered = sorted((k, str(v)) for k, v in payload.items())
             check_string = urlencode(ordered) + secret
             expected = hashlib.sha1(check_string.encode()).hexdigest()  # noqa: S324
             if expected != verify_hash:
-                raise ValueError("Invalid Plisio callback signature")
-        return data
+                raise WebhookVerificationError("Invalid Plisio callback signature")
 
+        return payload
+
+    @transaction.atomic
     def handle_webhook_event(self, event_data: dict) -> None:
         txn_id = event_data.get("txn_id", event_data.get("id", ""))
         status = event_data.get("status", "")
@@ -118,8 +143,10 @@ class PlisioPaymentService(BasePaymentProvider):
                 "payload": event_data,
             },
         )
-        if not created and webhook.status == WebhookProcessingStatus.PROCESSED:
-            return
+        if not created:
+            webhook = WebhookEvent.objects.select_for_update().get(pk=webhook.pk)
+            if webhook.status == WebhookProcessingStatus.PROCESSED:
+                return
 
         try:
             if status in ("completed", "confirmed", "mismatch"):
@@ -132,6 +159,7 @@ class PlisioPaymentService(BasePaymentProvider):
         except Exception as exc:
             webhook.status = WebhookProcessingStatus.FAILED
             webhook.error_message = str(exc)
+            logger.exception("Plisio webhook processing failed")
             raise
         finally:
             webhook.save()
@@ -144,10 +172,14 @@ class PlisioPaymentService(BasePaymentProvider):
         except (Invoice.DoesNotExist, ValueError):
             return
 
-        attempt = PaymentAttempt.objects.filter(
-            invoice=invoice,
-            provider=self.provider,
-        ).order_by("-created_at").first()
+        attempt = (
+            PaymentAttempt.objects.filter(
+                invoice=invoice,
+                provider=self.provider,
+            )
+            .order_by("-created_at")
+            .first()
+        )
 
         if attempt:
             attempt.status = PaymentAttemptStatus.SUCCEEDED

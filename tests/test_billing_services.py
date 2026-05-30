@@ -62,7 +62,7 @@ def test_create_invoice(user, price):
 
 @pytest.mark.django_db
 def test_create_invoice_with_promo(user, price):
-    PromoCode.objects.create(
+    promo = PromoCode.objects.create(
         code="SAVE20",
         discount_type=DiscountType.PERCENT,
         percent_value=20,
@@ -76,6 +76,8 @@ def test_create_invoice_with_promo(user, price):
     )
     assert invoice.discount_minor == 200
     assert invoice.total_minor == 800
+    promo.refresh_from_db()
+    assert promo.used_count == 0
 
 
 @pytest.mark.django_db

@@ -88,22 +88,32 @@ DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET = "whsec_..."    # Stripe → Develop
 # Plisio — крипто-инвойсы
 DJANGO_STRIPE_PLISIO_PLISIO_API_KEY = "ваш_api_key"
 DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET = "секрет_из_кабинета"
+DJANGO_STRIPE_PLISIO_PLISIO_WEBHOOK_URL = "https://ваш-сайт.com/billing/webhooks/plisio/"
 
 # Валюты и редиректы после оплаты
 DJANGO_STRIPE_PLISIO_DEFAULT_CURRENCY = "USD"
 DJANGO_STRIPE_PLISIO_ALLOWED_CURRENCIES = ["USD", "EUR", "RUB"]
 DJANGO_STRIPE_PLISIO_SUCCESS_URL = "https://ваш-сайт.com/payment/success"
 DJANGO_STRIPE_PLISIO_CANCEL_URL = "https://ваш-сайт.com/payment/cancel"
+
+# Безопасность и срок жизни счёта
+DJANGO_STRIPE_PLISIO_REQUIRE_WEBHOOK_SECRET = True  # в prod всегда True
+DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS = 24  # опционально
+DJANGO_STRIPE_PLISIO_USER_ID_FIELD = "pk"  # или uuid-поле вашего User
 ```
 
 | Переменная | Зачем нужна |
 |------------|-------------|
 | `STRIPE_SECRET_KEY` | Создание Checkout Session |
-| `STRIPE_WEBHOOK_SECRET` | Проверка, что callback пришёл от Stripe |
+| `STRIPE_WEBHOOK_SECRET` | Проверка подписи Stripe (обязательно в prod) |
 | `PLISIO_API_KEY` | Создание crypto invoice |
-| `PLISIO_CALLBACK_SECRET` | Проверка подписи Plisio callback |
-| `SUCCESS_URL` / `CANCEL_URL` | Куда вернуть пользователя после Stripe Checkout |
-| `ALLOWED_CURRENCIES` | Какие валюты разрешены в счетах |
+| `PLISIO_CALLBACK_SECRET` | Проверка `verify_hash` Plisio |
+| `PLISIO_WEBHOOK_URL` | URL callback для Plisio API (`callback_url`) |
+| `SUCCESS_URL` / `CANCEL_URL` | Редирект пользователя после Stripe Checkout |
+| `REQUIRE_WEBHOOK_SECRET` | Отклонять webhook без секрета (fail-closed) |
+| `ALLOWED_CURRENCIES` | Разрешённые валюты в счетах |
+
+> **Важно:** `PLISIO_WEBHOOK_URL` — это endpoint приложения (`/billing/webhooks/plisio/`), а не страница «спасибо за оплату».
 
 #### 1.3. Webhooks у провайдеров
 

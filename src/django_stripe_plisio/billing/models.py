@@ -282,6 +282,13 @@ class BalanceLedger(models.Model):
         indexes = [
             models.Index(fields=["user", "currency"]),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["reference"],
+                condition=models.Q(reference__gt=""),
+                name="dsp_unique_ledger_reference",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"Ledger {self.entry_type} {self.amount_minor} {self.currency}"

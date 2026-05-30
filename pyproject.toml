@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-stripe-plisio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable Django billing package for Stripe and Plisio payments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 api = ["djangorestframework>=3.15"]
-celery = ["celery>=5.3", "redis>=5.0"]
 dev = [
     "django-stripe-plisio[api]",
     "build>=1.2",

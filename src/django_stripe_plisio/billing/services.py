@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
@@ -38,6 +39,13 @@ def validate_currency(currency: str) -> str:
         msg = f"Currency {currency} not allowed. Allowed: {allowed}"
         raise ValueError(msg)
     return currency
+
+
+def validate_price_for_sale(price: Price) -> None:
+    if not price.is_active:
+        raise ValueError("Price is not active")
+    if not price.product.is_active:
+        raise ValueError("Product is not active")
 
 
 def calculate_discount_minor(
@@ -104,6 +112,13 @@ def resolve_private_grant(user: AbstractBaseUser) -> DiscountGrant | None:
     return None
 
 
+def _invoice_expires_at() -> timezone.datetime | None:
+    ttl = PackageSettings.invoice_pending_ttl_hours()
+    if ttl is None:
+        return None
+    return timezone.now() + timedelta(hours=int(ttl))
+
+
 @transaction.atomic
 def create_invoice(
     user: AbstractBaseUser,
@@ -120,6 +135,9 @@ def create_invoice(
     if provider not in PaymentProvider.values:
         raise ValueError(f"Invalid provider: {provider}")
 
+    price = Price.objects.select_related("product").get(pk=price.pk)
+    validate_price_for_sale(price)
+
     currency = validate_currency(price.currency)
     subtotal = price.amount_minor * quantity
 
@@ -131,6 +149,7 @@ def create_invoice(
         subtotal_minor=subtotal,
         discount_minor=0,
         total_minor=subtotal,
+        expires_at=_invoice_expires_at(),
         metadata=metadata or {},
     )
 
@@ -188,8 +207,6 @@ def create_invoice(
             currency=currency,
             label=label,
         )
-        if promo_obj:
-            PromoCode.objects.filter(pk=promo_obj.pk).update(used_count=promo_obj.used_count + 1)
 
     total = max(0, subtotal - discount_minor)
     invoice.discount_minor = discount_minor
@@ -226,7 +243,6 @@ def apply_promo(invoice: Invoice, code: str) -> Invoice:
         currency=invoice.currency,
         label=promo.code,
     )
-    PromoCode.objects.filter(pk=promo.pk).update(used_count=promo.used_count + 1)
 
     invoice.discount_minor = discount_minor
     invoice.total_minor = max(0, invoice.subtotal_minor - discount_minor)
@@ -266,6 +282,24 @@ def get_user_balance(user: AbstractBaseUser, currency: str) -> int:
     return int(result["total"] or 0)
 
 
+def _increment_promo_usage_for_invoice(invoice: Invoice) -> None:
+    """Увеличить used_count промокода после успешной оплаты."""
+    discount = (
+        InvoiceDiscount.objects.filter(invoice=invoice, promo_code__isnull=False)
+        .select_related("promo_code")
+        .first()
+    )
+    if not discount or not discount.promo_code_id:
+        return
+
+    promo = PromoCode.objects.select_for_update().get(pk=discount.promo_code_id)
+    if promo.max_uses is not None and promo.used_count >= promo.max_uses:
+        raise ValueError(f"Promo code {promo.code} usage limit exceeded")
+
+    promo.used_count += 1
+    promo.save(update_fields=["used_count"])
+
+
 @transaction.atomic
 def record_ledger_entry(
     user: AbstractBaseUser,
@@ -279,16 +313,25 @@ def record_ledger_entry(
 ) -> BalanceLedger:
     """Запись проводки в ledger (append-only)."""
     currency = validate_currency(currency)
-    entry = BalanceLedger.objects.create(
-        user=user,
-        entry_type=entry_type,
-        amount_minor=amount_minor,
-        currency=currency,
-        invoice=invoice,
-        reference=reference,
-        note=note,
-        metadata=metadata or {},
-    )
+    if reference:
+        existing = BalanceLedger.objects.filter(reference=reference).first()
+        if existing:
+            return existing
+
+    try:
+        entry = BalanceLedger.objects.create(
+            user=user,
+            entry_type=entry_type,
+            amount_minor=amount_minor,
+            currency=currency,
+            invoice=invoice,
+            reference=reference,
+            note=note,
+            metadata=metadata or {},
+        )
+    except IntegrityError:
+        entry = BalanceLedger.objects.get(reference=reference)
+
     balance_changed.send(
         sender=BalanceLedger,
         user=user,
@@ -302,6 +345,8 @@ def record_ledger_entry(
 @transaction.atomic
 def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
     """Отметить счёт оплаченным и начислить баланс/entitlement."""
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+
     if invoice.status == InvoiceStatus.PAID:
         return invoice
 
@@ -310,6 +355,8 @@ def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
     if external_id:
         invoice.external_id = external_id
     invoice.save(update_fields=["status", "paid_at", "external_id", "updated_at"])
+
+    _increment_promo_usage_for_invoice(invoice)
 
     record_ledger_entry(
         user=invoice.user,
@@ -334,3 +381,14 @@ def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
 
     invoice_paid.send(sender=Invoice, invoice=invoice)
     return invoice
+
+
+def expire_pending_invoices() -> int:
+    """Перевести просроченные pending-счета в expired."""
+    now = timezone.now()
+    qs = Invoice.objects.filter(
+        status=InvoiceStatus.PENDING,
+        expires_at__isnull=False,
+        expires_at__lt=now,
+    )
+    return qs.update(status=InvoiceStatus.EXPIRED, updated_at=now)
