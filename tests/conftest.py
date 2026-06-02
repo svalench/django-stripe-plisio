@@ -14,3 +14,22 @@ def dsp_package_settings(settings):
 def user(db):
     User = get_user_model()
     return User.objects.create_user(username="testuser", password="testpass")
+
+
+@pytest.fixture
+def product(db):
+    from django_stripe_plisio.billing.models import Product
+
+    return Product.objects.create(code="pro", name="Pro Plan")
+
+
+@pytest.fixture
+def price(product):
+    from django_stripe_plisio.billing.models import Price
+
+    return Price.objects.create(
+        product=product,
+        currency="USD",
+        amount_minor=1000,
+        billing_period="one_time",
+    )

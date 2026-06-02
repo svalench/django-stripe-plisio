@@ -12,7 +12,7 @@ import requests
 from django.db import transaction
 from django.utils import timezone
 
-from django_stripe_plisio.billing.enums import PaymentProvider
+from django_stripe_plisio.billing.enums import InvoiceStatus, PaymentProvider
 from django_stripe_plisio.billing.models import Invoice
 from django_stripe_plisio.billing.money import minor_to_major_amount
 from django_stripe_plisio.billing.services import mark_invoice_paid
@@ -21,6 +21,7 @@ from django_stripe_plisio.exceptions import WebhookVerificationError
 from django_stripe_plisio.payments.enums import PaymentAttemptStatus, WebhookProcessingStatus
 from django_stripe_plisio.payments.models import PaymentAttempt, ProviderTransaction, WebhookEvent
 from django_stripe_plisio.payments.services.base import BasePaymentProvider
+from django_stripe_plisio.payments.sync_types import InvoiceSyncOutcome
 from django_stripe_plisio.signals import payment_failed
 
 logger = logging.getLogger(__name__)
@@ -201,3 +202,95 @@ class PlisioPaymentService(BasePaymentProvider):
         )
 
         mark_invoice_paid(invoice, external_id=txn_id)
+
+    def _apply_remote_unpaid_status(
+        self,
+        invoice: Invoice,
+        *,
+        invoice_status: str,
+        attempt_status: str,
+    ) -> InvoiceSyncOutcome:
+        if invoice.status != InvoiceStatus.PENDING:
+            return InvoiceSyncOutcome.UNCHANGED
+
+        now = timezone.now()
+        invoice.status = invoice_status
+        invoice.updated_at = now
+        invoice.save(update_fields=["status", "updated_at"])
+
+        attempt = (
+            PaymentAttempt.objects.filter(
+                invoice=invoice,
+                provider=self.provider,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if attempt:
+            attempt.status = attempt_status
+            attempt.save(update_fields=["status"])
+
+        if invoice_status == InvoiceStatus.EXPIRED:
+            return InvoiceSyncOutcome.EXPIRED
+        return InvoiceSyncOutcome.CANCELLED
+
+    def sync_invoice_status(self, invoice: Invoice) -> InvoiceSyncOutcome:
+        """Опрос Plisio operation по txn_id (external_id счёта)."""
+        if invoice.status != InvoiceStatus.PENDING:
+            return InvoiceSyncOutcome.UNCHANGED
+
+        txn_id = invoice.external_id
+        if not txn_id:
+            return InvoiceSyncOutcome.UNCHANGED
+
+        api_key = self._api_key()
+        if not api_key:
+            logger.warning("Plisio API key not configured, skip sync for invoice %s", invoice.pk)
+            return InvoiceSyncOutcome.ERROR
+
+        try:
+            response = requests.get(
+                f"{PLISIO_API_URL}/operations/{txn_id}",
+                params={"api_key": api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException:
+            logger.exception("Plisio operation retrieve failed for invoice %s", invoice.pk)
+            return InvoiceSyncOutcome.ERROR
+
+        if payload.get("status") != "success":
+            return InvoiceSyncOutcome.ERROR
+
+        operation = payload.get("data") or {}
+        remote_status = operation.get("status", "")
+
+        if remote_status in ("completed", "confirmed"):
+            order_number = operation.get("order_number", str(invoice.pk))
+            self._handle_paid(operation, order_number, txn_id)
+            return InvoiceSyncOutcome.PAID
+
+        if remote_status == "mismatch":
+            logger.warning(
+                "Plisio mismatch for invoice %s (txn_id=%s), payment not applied",
+                invoice.pk,
+                txn_id,
+            )
+            return InvoiceSyncOutcome.SKIPPED
+
+        if remote_status == "expired":
+            return self._apply_remote_unpaid_status(
+                invoice,
+                invoice_status="expired",
+                attempt_status="failed",
+            )
+
+        if remote_status in ("cancelled", "cancelled duplicate"):
+            return self._apply_remote_unpaid_status(
+                invoice,
+                invoice_status="cancelled",
+                attempt_status="cancelled",
+            )
+
+        return InvoiceSyncOutcome.UNCHANGED

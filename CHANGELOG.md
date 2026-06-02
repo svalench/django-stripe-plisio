@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- Опрос статусов pending-счетов у Stripe/Plisio (`sync_pending_invoices`, `sync_invoice_status`).
+- Management command `dsp_sync_invoices` (`--dry-run`, `--batch-size`).
+- Настройки `DJANGO_STRIPE_PLISIO_CRON`, `INVOICE_SYNC_BATCH_SIZE`, `INVOICE_SYNC_PROVIDERS`.
+- `django_stripe_plisio.cron.build_cronjobs()` для django-crontab.
+- Optional extra `[cron]` → `django-crontab>=2.4`.
+
 ## 0.2.0
 
 ### Security

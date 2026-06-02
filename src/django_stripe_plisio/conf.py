@@ -68,3 +68,37 @@ class PackageSettings:
     def invoice_pending_ttl_hours(cls) -> int | None:
         """Через сколько часов pending-счёт истекает (None — не истекает автоматически)."""
         return _get(f"{cls.PREFIX}INVOICE_PENDING_TTL_HOURS", None)
+
+    @classmethod
+    def cron_config(cls) -> dict:
+        """Периодические задачи: sync_invoices, expire_invoices (enabled + schedule)."""
+        raw = _get(f"{cls.PREFIX}CRON", None)
+        if raw is None:
+            return {}
+        return dict(raw)
+
+    @classmethod
+    def cron_task_enabled(cls, task_name: str) -> bool:
+        task = cls.cron_config().get(task_name) or {}
+        return bool(task.get("enabled", False))
+
+    @classmethod
+    def cron_task_schedule(cls, task_name: str) -> str:
+        task = cls.cron_config().get(task_name) or {}
+        return str(task.get("schedule", "") or "")
+
+    @classmethod
+    def invoice_sync_batch_size(cls) -> int:
+        value = _get(f"{cls.PREFIX}INVOICE_SYNC_BATCH_SIZE", 100)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 100
+
+    @classmethod
+    def invoice_sync_providers(cls) -> list[str] | None:
+        """None — все провайдеры; иначе список stripe/plisio."""
+        raw = _get(f"{cls.PREFIX}INVOICE_SYNC_PROVIDERS", None)
+        if raw is None:
+            return None
+        return [str(p).lower() for p in raw]

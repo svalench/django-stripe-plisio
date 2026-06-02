@@ -10,7 +10,7 @@ import stripe
 from django.db import transaction
 from django.utils import timezone
 
-from django_stripe_plisio.billing.enums import BillingPeriod, PaymentProvider
+from django_stripe_plisio.billing.enums import BillingPeriod, InvoiceStatus, PaymentProvider
 from django_stripe_plisio.billing.models import Invoice, InvoiceLine
 from django_stripe_plisio.billing.services import mark_invoice_paid
 from django_stripe_plisio.billing.utils import user_external_id
@@ -28,6 +28,7 @@ from django_stripe_plisio.payments.models import (
     WebhookEvent,
 )
 from django_stripe_plisio.payments.services.base import BasePaymentProvider
+from django_stripe_plisio.payments.sync_types import InvoiceSyncOutcome
 from django_stripe_plisio.signals import payment_failed
 
 logger = logging.getLogger(__name__)
@@ -171,14 +172,18 @@ class StripePaymentService(BasePaymentProvider):
 
     def _handle_checkout_completed(self, event_data: dict) -> None:
         obj = event_data.get("data", {}).get("object", {})
+        self._apply_checkout_session_paid(obj)
+
+    def _apply_checkout_session_paid(self, obj: dict) -> bool:
+        """Зафиксировать оплату по объекту Checkout Session. Возвращает True, если счёт оплачен."""
         invoice_id = obj.get("metadata", {}).get("invoice_id") or obj.get("client_reference_id")
         if not invoice_id:
-            return
+            return False
 
         try:
             invoice = Invoice.objects.get(pk=int(invoice_id))
         except (Invoice.DoesNotExist, ValueError):
-            return
+            return False
 
         session_id = obj.get("id", "")
         attempt = PaymentAttempt.objects.filter(
@@ -214,6 +219,32 @@ class StripePaymentService(BasePaymentProvider):
                 stripe_subscription_id=subscription_id,
                 stripe_customer_id=obj.get("customer", ""),
             )
+        return True
+
+    def sync_invoice_status(self, invoice: Invoice) -> InvoiceSyncOutcome:
+        """Опрос Stripe Checkout Session по external_id счёта."""
+        if invoice.status != InvoiceStatus.PENDING:
+            return InvoiceSyncOutcome.UNCHANGED
+
+        session_id = invoice.external_id
+        if not session_id:
+            return InvoiceSyncOutcome.UNCHANGED
+
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except stripe.StripeError:
+            logger.exception("Stripe session retrieve failed for invoice %s", invoice.pk)
+            return InvoiceSyncOutcome.ERROR
+
+        obj = dict(session)
+        payment_status = obj.get("payment_status", "")
+        status = obj.get("status", "")
+
+        if payment_status == "paid" and status == "complete":
+            self._apply_checkout_session_paid(obj)
+            return InvoiceSyncOutcome.PAID
+
+        return InvoiceSyncOutcome.UNCHANGED
 
     def _handle_subscription_upsert(self, event_data: dict) -> None:
         obj = event_data.get("data", {}).get("object", {})
