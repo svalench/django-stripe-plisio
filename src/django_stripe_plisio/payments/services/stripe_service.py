@@ -236,7 +236,7 @@ class StripePaymentService(BasePaymentProvider):
             logger.exception("Stripe session retrieve failed for invoice %s", invoice.pk)
             return InvoiceSyncOutcome.ERROR
 
-        obj = dict(session)
+        obj: dict[str, Any] = session if isinstance(session, dict) else session.to_dict()
         payment_status = obj.get("payment_status", "")
         status = obj.get("status", "")
 
