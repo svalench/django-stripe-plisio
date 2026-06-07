@@ -1,55 +1,55 @@
 # django-stripe-plisio
 
-Reusable Django-пакет для биллинга: каталог тарифов, счета, баланс, промокоды и два платёжных провайдера — **Stripe** (карты, подписки) и **Plisio** (крипто-инвойсы).
+Reusable Django package for billing: plan catalog, invoices, balance, promo codes, and two payment providers — **Stripe** (cards, subscriptions) and **Plisio** (crypto invoices).
 
-Пакет не привязан к конкретному проекту: подключается через `INSTALLED_APPS`, settings-константы и `include()` URL. Связь с пользователем — только через `settings.AUTH_USER_MODEL`.
+The package is not tied to a specific project: it is integrated via `INSTALLED_APPS`, settings constants, and `include()` URLs. The link to the user is only through `settings.AUTH_USER_MODEL`.
 
 ---
 
-## Содержание
+## Table of Contents
 
-- [Бизнес-процесс: от настройки до оплаты](#бизнес-процесс-от-настройки-до-оплаты)
-- [Возможности](#возможности)
-- [Архитектура](#архитектура)
-- [Структура пакета](#структура-пакета)
-- [Установка](#установка)
-- [Подключение в проект](#подключение-в-проект)
-- [Настройки](#настройки)
-- [Периодические задачи (cron)](#периодические-задачи-cron)
-- [Модели данных](#модели-данных)
-- [Сервисный слой](#сервисный-слой)
-- [Платёжные провайдеры](#платёжные-провайдеры)
+- [Business process: from setup to payment](#business-process-from-setup-to-payment)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Package structure](#package-structure)
+- [Installation](#installation)
+- [Integration in a project](#integration-in-a-project)
+- [Configuration](#configuration)
+- [Scheduled tasks (cron)](#scheduled-tasks-cron)
+- [Data models](#data-models)
+- [Service layer](#service-layer)
+- [Payment providers](#payment-providers)
 - [REST API](#rest-api)
 - [Webhooks](#webhooks)
-- [Сигналы](#сигналы)
+- [Signals](#signals)
 - [Django Admin](#django-admin)
-- [Типовые сценарии](#типовые-сценарии)
-- [Инварианты и ограничения](#инварианты-и-ограничения)
-- [Разработка и тесты](#разработка-и-тесты)
+- [Common scenarios](#common-scenarios)
+- [Invariants and constraints](#invariants-and-constraints)
+- [Development and testing](#development-and-testing)
 
 ---
 
-## Бизнес-процесс: от настройки до оплаты
+## Business process: from setup to payment
 
-Ниже — полный путь «как это работает в жизни». **Сначала** разработчик подключает пакет и прописывает ключи в settings, **потом** менеджер наполняет каталог в админке, **затем** пользователь платит через ваш код.
+Below is the full path of how this works in practice. **First**, the developer integrates the package and configures keys in settings; **then**, the manager fills the catalog in the admin; **finally**, the user pays through your code.
 
 ```mermaid
 flowchart LR
-    A[1. Settings и подключение] --> B[2. Админка: продукты и цены]
-    B --> C[3. Код: счёт и редирект]
-    C --> D[4. Пользователь платит]
-    D --> E[5. Webhook подтверждает]
-    E --> F[6. Админка: paid, ledger]
-    E -.-> G[5b. Cron sync — если webhook потерян]
+    A[1. Settings and integration] --> B[2. Admin: products and prices]
+    B --> C[3. Code: invoice and redirect]
+    C --> D[4. User pays]
+    D --> E[5. Webhook confirms]
+    E --> F[6. Admin: paid, ledger]
+    E -.-> G[5b. Cron sync — if webhook is lost]
 ```
 
 ---
 
-### Шаг 1. Settings и подключение пакета (один раз, в первую очередь)
+### Step 1. Settings and package integration (once, first)
 
-Пока не настроены переменные и не подключён пакет — оплаты работать не будут. Делает **разработчик**.
+Until variables are configured and the package is integrated, payments will not work. This is done by the **developer**.
 
-#### 1.1. Установка и приложения в проекте
+#### 1.1. Installation and apps in the project
 
 ```bash
 pip install django-stripe-plisio[api]
@@ -76,34 +76,34 @@ python manage.py migrate dsp_billing
 python manage.py migrate dsp_payments
 ```
 
-После миграций в `/admin/` появятся разделы **Billing** и **Payments**.
+After migrations, **Billing** and **Payments** sections appear in `/admin/`.
 
-#### 1.2. Ключи Stripe и Plisio
+#### 1.2. Stripe and Plisio keys
 
-Берём в [кабинете Stripe](https://dashboard.stripe.com) и [кабинете Plisio](https://plisio.net), прописываем в `settings.py` или `.env`:
+Obtain them from the [Stripe Dashboard](https://dashboard.stripe.com) and [Plisio Dashboard](https://plisio.net), then set them in `settings.py` or `.env`:
 
 ```python
-# Stripe — карты и подписки
-DJANGO_STRIPE_PLISIO_STRIPE_SECRET_KEY = "sk_live_..."      # тест: sk_test_...
+# Stripe — cards and subscriptions
+DJANGO_STRIPE_PLISIO_STRIPE_SECRET_KEY = "sk_live_..."      # test: sk_test_...
 DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET = "whsec_..."    # Stripe → Developers → Webhooks
 
-# Plisio — крипто-инвойсы
-DJANGO_STRIPE_PLISIO_PLISIO_API_KEY = "ваш_api_key"
-DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET = "секрет_из_кабинета"
-DJANGO_STRIPE_PLISIO_PLISIO_WEBHOOK_URL = "https://ваш-сайт.com/billing/webhooks/plisio/"
+# Plisio — crypto invoices
+DJANGO_STRIPE_PLISIO_PLISIO_API_KEY = "your_api_key"
+DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET = "secret_from_dashboard"
+DJANGO_STRIPE_PLISIO_PLISIO_WEBHOOK_URL = "https://your-site.com/billing/webhooks/plisio/"
 
-# Валюты и редиректы после оплаты
+# Currencies and redirects after payment
 DJANGO_STRIPE_PLISIO_DEFAULT_CURRENCY = "USD"
 DJANGO_STRIPE_PLISIO_ALLOWED_CURRENCIES = ["USD", "EUR", "RUB"]
-DJANGO_STRIPE_PLISIO_SUCCESS_URL = "https://ваш-сайт.com/payment/success"
-DJANGO_STRIPE_PLISIO_CANCEL_URL = "https://ваш-сайт.com/payment/cancel"
+DJANGO_STRIPE_PLISIO_SUCCESS_URL = "https://your-site.com/payment/success"
+DJANGO_STRIPE_PLISIO_CANCEL_URL = "https://your-site.com/payment/cancel"
 
-# Безопасность и срок жизни счёта
-DJANGO_STRIPE_PLISIO_REQUIRE_WEBHOOK_SECRET = True  # в prod всегда True
-DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS = 24  # опционально
-DJANGO_STRIPE_PLISIO_USER_ID_FIELD = "pk"  # или uuid-поле вашего User
+# Security and invoice lifetime
+DJANGO_STRIPE_PLISIO_REQUIRE_WEBHOOK_SECRET = True  # always True in prod
+DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS = 24  # optional
+DJANGO_STRIPE_PLISIO_USER_ID_FIELD = "pk"  # or your User's uuid field
 
-# Периодика: догонка статусов и истечение pending (опционально, см. раздел «Периодические задачи»)
+# Scheduled tasks: status catch-up and pending expiration (optional, see «Scheduled tasks» section)
 DJANGO_STRIPE_PLISIO_CRON = {
     "sync_invoices": {
         "enabled": True,
@@ -117,99 +117,99 @@ DJANGO_STRIPE_PLISIO_CRON = {
 DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE = 100
 ```
 
-| Переменная | Зачем нужна |
+| Variable | Purpose |
 |------------|-------------|
-| `STRIPE_SECRET_KEY` | Создание Checkout Session и опрос статуса в cron |
-| `STRIPE_WEBHOOK_SECRET` | Проверка подписи Stripe (обязательно в prod) |
-| `PLISIO_API_KEY` | Создание crypto invoice и опрос operation в cron |
-| `PLISIO_CALLBACK_SECRET` | Проверка `verify_hash` Plisio |
-| `PLISIO_WEBHOOK_URL` | URL callback для Plisio API (`callback_url`) |
-| `SUCCESS_URL` / `CANCEL_URL` | Редирект пользователя после Stripe Checkout |
-| `REQUIRE_WEBHOOK_SECRET` | Отклонять webhook без секрета (fail-closed) |
-| `ALLOWED_CURRENCIES` | Разрешённые валюты в счетах |
-| `INVOICE_PENDING_TTL_HOURS` | `expires_at` для pending + `dsp_expire_invoices` |
-| `CRON` | Расписание `dsp_sync_invoices` / `dsp_expire_invoices` |
-| `INVOICE_SYNC_BATCH_SIZE` | Сколько pending-счетов опрашивать за один прогон sync |
+| `STRIPE_SECRET_KEY` | Creating Checkout Session and polling status in cron |
+| `STRIPE_WEBHOOK_SECRET` | Stripe signature verification (required in prod) |
+| `PLISIO_API_KEY` | Creating crypto invoice and polling operation in cron |
+| `PLISIO_CALLBACK_SECRET` | Plisio `verify_hash` verification |
+| `PLISIO_WEBHOOK_URL` | Callback URL for Plisio API (`callback_url`) |
+| `SUCCESS_URL` / `CANCEL_URL` | User redirect after Stripe Checkout |
+| `REQUIRE_WEBHOOK_SECRET` | Reject webhooks without a secret (fail-closed) |
+| `ALLOWED_CURRENCIES` | Allowed currencies in invoices |
+| `INVOICE_PENDING_TTL_HOURS` | `expires_at` for pending + `dsp_expire_invoices` |
+| `CRON` | Schedule for `dsp_sync_invoices` / `dsp_expire_invoices` |
+| `INVOICE_SYNC_BATCH_SIZE` | How many pending invoices to poll per sync run |
 
-> **Важно:** `PLISIO_WEBHOOK_URL` — это endpoint приложения (`/billing/webhooks/plisio/`), а не страница «спасибо за оплату».
+> **Important:** `PLISIO_WEBHOOK_URL` is the application endpoint (`/billing/webhooks/plisio/`), not the «thank you for your payment» page.
 
-#### 1.3. Webhooks у провайдеров
+#### 1.3. Webhooks at providers
 
-Основной канал подтверждения оплаты — **webhook**. Без него счёт останется **pending**, даже если пользователь уже заплатил.
+The primary channel for payment confirmation is the **webhook**. Without it, the invoice stays **pending** even if the user has already paid.
 
-| Провайдер | URL в кабинете провайдера | Событие |
+| Provider | URL in provider dashboard | Event |
 |-----------|---------------------------|---------|
-| Stripe | `https://ваш-сайт.com/billing/webhooks/stripe/` | `checkout.session.completed` |
-| Plisio | `https://ваш-сайт.com/billing/webhooks/plisio/` | callback при статусе `completed` |
+| Stripe | `https://your-site.com/billing/webhooks/stripe/` | `checkout.session.completed` |
+| Plisio | `https://your-site.com/billing/webhooks/plisio/` | callback on `completed` status |
 
-#### 1.4. Cron (резервный канал)
+#### 1.4. Cron (fallback channel)
 
-Если webhook не дошёл (сеть, downtime, неверный URL), включите периодический **sync** — команда `dsp_sync_invoices` опрашивает API Stripe/Plisio по `external_id` pending-счетов. Подробности — [Периодические задачи (cron)](#периодические-задачи-cron).
+If a webhook did not arrive (network, downtime, wrong URL), enable periodic **sync** — the `dsp_sync_invoices` command polls the Stripe/Plisio API by `external_id` of pending invoices. Details — [Scheduled tasks (cron)](#scheduled-tasks-cron).
 
-Минимум для prod:
+Minimum for prod:
 
-1. Настроить webhooks (шаг 1.3).
-2. Включить `DJANGO_STRIPE_PLISIO_CRON` и зарегистрировать задачи (`django-crontab` или system cron).
-3. **Сначала** в расписании `dsp_sync_invoices`, **потом** `dsp_expire_invoices`.
+1. Configure webhooks (step 1.3).
+2. Enable `DJANGO_STRIPE_PLISIO_CRON` and register tasks (`django-crontab` or system cron).
+3. **First** schedule `dsp_sync_invoices`, **then** `dsp_expire_invoices`.
 
-На этом шаге интеграция готова — можно переходить к каталогу.
+At this step the integration is ready — you can move on to the catalog.
 
 ---
 
-### Шаг 2. Менеджер заполняет каталог в админке
+### Step 2. Manager fills the catalog in the admin
 
-Когда settings уже настроены, заходим в `/admin/` и создаём то, что продаём.
+Once settings are configured, go to `/admin/` and create what you sell.
 
-| Раздел в админке | Что заполнить | Зачем |
+| Admin section | What to fill in | Why |
 |------------------|---------------|--------|
-| **Billing → Products** | `code` (например `pro`), название, описание, `is_active` | Тариф или услуга в каталоге |
-| **Billing → Prices** | продукт, `currency` (USD/EUR/…), `amount_minor`, период | Цена: **999** = 9.99 USD (в центах), не 9.99 в поле |
-| **Billing → Promo codes** *(опционально)* | код `SAVE10`, процент или фикс | Публичная скидка |
-| **Billing → Discount grants** *(опционально)* | пользователь, тип скидки | Личная скидка без промокода |
+| **Billing → Products** | `code` (e.g. `pro`), name, description, `is_active` | Plan or service in the catalog |
+| **Billing → Prices** | product, `currency` (USD/EUR/…), `amount_minor`, period | Price: **999** = 9.99 USD (in cents), not 9.99 in the field |
+| **Billing → Promo codes** *(optional)* | code `SAVE10`, percent or fixed | Public discount |
+| **Billing → Discount grants** *(optional)* | user, discount type | Personal discount without a promo code |
 
-**Пример:** тариф Pro = **1999** `amount_minor` + `USD` → пользователь платит **$19.99**.
+**Example:** Pro plan = **1999** `amount_minor` + `USD` → the user pays **$19.99**.
 
-Для подписок Stripe — период `month` или `year`. Для разовой оплаты — `one_time`.
+For Stripe subscriptions — period `month` or `year`. For one-time payment — `one_time`.
 
 ---
 
-### Шаг 3. Пишем код: пользователь выбирает тариф и уходит на оплату
+### Step 3. Write code: user selects a plan and goes to payment
 
-Пользователь в вашем приложении (сайт, API, личный кабинет) нажимает «Купить». В коде:
+The user in your application (website, API, dashboard) clicks «Buy». In code:
 
 ```python
 from django_stripe_plisio import api
 from django_stripe_plisio.billing.models import Price
 
 def buy_pro_plan(request):
-  # 1) Берём цену из каталога (ту, что создали в админке)
+  # 1) Get the price from the catalog (the one created in the admin)
   price = Price.objects.get(product__code="pro", currency="USD", is_active=True)
 
-  # 2) Выставляем счёт пользователю
-  #    provider="stripe" — оплата картой
-  #    provider="plisio" — оплата криптой
+  # 2) Issue an invoice to the user
+  #    provider="stripe" — card payment
+  #    provider="plisio" — crypto payment
   invoice = api.create_invoice(
       user=request.user,
       price=price,
       provider="stripe",
       quantity=1,
-      promo_code=request.POST.get("promo"),  # или None
+      promo_code=request.POST.get("promo"),  # or None
   )
 
-  # 3) Создаём сессию оплаты у провайдера
+  # 3) Create a payment session at the provider
   attempt = api.create_checkout(invoice)
 
-  # 4) Отправляем пользователя на страницу оплаты
+  # 4) Send the user to the payment page
   return redirect(attempt.payment_url)
 ```
 
-**Что происходит внутри:**
+**What happens internally:**
 
-1. В БД появляется **Invoice** (статус `pending`) и строка **InvoiceLine** со снимком цены.
-2. Если промокод валидный — пересчитывается `total_minor`, создаётся **InvoiceDiscount**.
-3. Создаётся **PaymentAttempt** и ссылка `payment_url` (Stripe Checkout или Plisio invoice).
+1. An **Invoice** (status `pending`) and an **InvoiceLine** row with a price snapshot appear in the database.
+2. If the promo code is valid — `total_minor` is recalculated, an **InvoiceDiscount** is created.
+3. A **PaymentAttempt** and `payment_url` link are created (Stripe Checkout or Plisio invoice).
 
-Тот же сценарий через REST API (если фронт на Vue/React):
+The same scenario via REST API (if the frontend is Vue/React):
 
 ```http
 POST /billing/invoices/
@@ -217,29 +217,29 @@ POST /billing/invoices/
 
 POST /billing/payments/stripe/checkout/
 { "invoice_id": 42 }
-→ в ответе payment_url — редирект пользователя
+→ payment_url in the response — redirect the user
 ```
 
 ---
 
-### Шаг 4. Пользователь платит
+### Step 4. User pays
 
-| Канал | Где платит | Что видит |
+| Channel | Where they pay | What they see |
 |-------|------------|-----------|
-| **Stripe** | Страница Stripe Checkout | Форма карты; для подписки — ежемесячное списание |
-| **Plisio** | Страница Plisio | Адрес / QR для перевода криптовалюты |
+| **Stripe** | Stripe Checkout page | Card form; for subscriptions — monthly charge |
+| **Plisio** | Plisio page | Address / QR for cryptocurrency transfer |
 
-Пока пользователь платит, счёт в админке: **Billing → Invoices** → статус **pending**.
+While the user is paying, the invoice in the admin: **Billing → Invoices** → status **pending**.
 
 ---
 
-### Шаг 5. После оплаты — что происходит автоматически
+### Step 5. After payment — what happens automatically
 
-1. Stripe или Plisio шлёт **webhook** на ваш сервер.
-2. Пакет проверяет подпись, сохраняет **WebhookEvent** (без дублей при повторе).
-3. Счёт переводится в **paid**, в **BalanceLedger** пишется пополнение.
-4. Создаётся **UserEntitlement** (доступ к тарифу).
-5. Срабатывают сигналы — в вашем коде можно отправить письмо или открыть фичу:
+1. Stripe or Plisio sends a **webhook** to your server.
+2. The package verifies the signature, saves **WebhookEvent** (no duplicates on retry).
+3. The invoice is moved to **paid**, a credit is written to **BalanceLedger**.
+4. **UserEntitlement** is created (access to the plan).
+5. Signals fire — in your code you can send an email or enable a feature:
 
 ```python
 from django.dispatch import receiver
@@ -247,82 +247,82 @@ from django_stripe_plisio.signals import invoice_paid
 
 @receiver(invoice_paid)
 def send_receipt(sender, invoice, **kwargs):
-    # ваше письмо / уведомление
+    # your email / notification
     ...
 ```
 
 ---
 
-### Шаг 6. Где смотреть результат в админке
+### Step 6. Where to check the result in the admin
 
-После успешной оплаты менеджер или поддержка проверяет:
+After successful payment, the manager or support checks:
 
-| Меню в админке | Что смотреть |
+| Admin menu | What to look at |
 |----------------|--------------|
-| **Billing → Invoices** | Статус **paid**, сумма, `paid_at`, ссылка на провайдера |
-| **Billing → Balance ledger** | Проводка **credit** на сумму счёта |
-| **Billing → User entitlements** | Выданный доступ к продукту и срок |
-| **Payments → Payment attempts** | Попытка со статусом **succeeded**, `payment_url`, ошибки если были |
-| **Payments → Stripe payment attempts** | Только оплаты через Stripe |
-| **Payments → Plisio payment attempts** | Только крипто-оплаты |
-| **Payments → Webhook events** | Сырые callback’и, статус обработки |
-| **Payments → Provider transactions** | Сверка с ID транзакции у провайдера |
+| **Billing → Invoices** | Status **paid**, amount, `paid_at`, link to provider |
+| **Billing → Balance ledger** | **credit** entry for the invoice amount |
+| **Billing → User entitlements** | Granted product access and period |
+| **Payments → Payment attempts** | Attempt with **succeeded** status, `payment_url`, errors if any |
+| **Payments → Stripe payment attempts** | Stripe payments only |
+| **Payments → Plisio payment attempts** | Crypto payments only |
+| **Payments → Webhook events** | Raw callbacks, processing status |
+| **Payments → Provider transactions** | Reconciliation with provider transaction ID |
 
-**Быстрая проверка «оплатил ли клиент»:**  
-**Billing → Invoices** → фильтр по пользователю и статусу **paid**.
+**Quick check «did the client pay»:**  
+**Billing → Invoices** → filter by user and status **paid**.
 
-**Разбор проблемы «деньги списались, доступа нет»:**  
-**Payments → Webhook events** — есть ли событие со статусом **processed**; если **failed** — смотреть `error_message`.
+**Troubleshooting «money was charged, no access»:**  
+**Payments → Webhook events** — is there an event with **processed** status; if **failed** — check `error_message`.
 
 ---
 
-### Шаг 7. Два канала оплаты — как выбрать
+### Step 7. Two payment channels — how to choose
 
-| Нужно | Provider в `create_invoice` | Админка попыток |
+| Need | Provider in `create_invoice` | Admin attempts |
 |-------|----------------------------|-----------------|
-| Карта, Apple Pay, подписка | `"stripe"` | Stripe payment attempts |
-| Криптовалюта | `"plisio"` | Plisio payment attempts |
+| Card, Apple Pay, subscription | `"stripe"` | Stripe payment attempts |
+| Cryptocurrency | `"plisio"` | Plisio payment attempts |
 
-Один и тот же продукт может иметь несколько **Prices** (USD/EUR) — пользователь выбирает валюту на фронте, вы передаёте нужный `price_id`.
+The same product can have multiple **Prices** (USD/EUR) — the user selects the currency on the frontend, you pass the appropriate `price_id`.
 
 ---
 
-### Краткая шпаргалка по ролям
+### Quick role cheat sheet
 
-| Роль | Действия | Когда |
+| Role | Actions | When |
 |------|----------|--------|
-| **Разработчик** | Шаг 1: pip, `INSTALLED_APPS`, migrate, все `DJANGO_STRIPE_PLISIO_*`, webhooks, cron | Первым делом |
-| **Менеджер** | Шаг 2: Products, Prices, Promo codes в админке | После настройки settings |
-| **Разработчик** | Шаг 3: код `create_invoice` + `create_checkout`, сигналы | После каталога |
-| **Пользователь** | «Купить» → Stripe/Plisio → возврат на `SUCCESS_URL` | В проде |
-| **Поддержка** | Шаг 6: Invoices (paid?), Payment attempts, Webhook events | После оплаты |
+| **Developer** | Step 1: pip, `INSTALLED_APPS`, migrate, all `DJANGO_STRIPE_PLISIO_*`, webhooks, cron | First |
+| **Manager** | Step 2: Products, Prices, Promo codes in the admin | After settings are configured |
+| **Developer** | Step 3: `create_invoice` + `create_checkout` code, signals | After the catalog |
+| **User** | «Buy» → Stripe/Plisio → return to `SUCCESS_URL` | In production |
+| **Support** | Step 6: Invoices (paid?), Payment attempts, Webhook events | After payment |
 
-Дальше в документе — технические детали: модели, API, архитектура.
+The rest of the document covers technical details: models, API, architecture.
 
 ---
 
-## Возможности
+## Features
 
-| Область | Что умеет пакет |
+| Area | What the package does |
 |--------|------------------|
-| Каталог | Продукты (`Product`) и цены (`Price`) в minor units + валюта |
-| Счета | `Invoice` + строки `InvoiceLine` со снимком цены на момент выставления |
-| Скидки | Публичные `PromoCode` и приватные `DiscountGrant` |
-| Оплата | Stripe Checkout / Plisio invoice, раздельные попытки и логи |
-| Баланс | Append-only `BalanceLedger`, расчёт баланса по валюте |
-| Доступ | `UserEntitlement` после оплаты (без жёсткой бизнес-логики в пакете) |
-| Подписки | `StripeSubscription` — recurring только через Stripe |
-| Аудит | `PaymentAttempt`, `WebhookEvent`, `ProviderTransaction` |
-| Cron | `dsp_sync_invoices` — опрос API провайдеров; `dsp_expire_invoices` — TTL pending |
-| Расписание | `DJANGO_STRIPE_PLISIO_CRON` + `build_cronjobs()` для django-crontab |
+| Catalog | Products (`Product`) and prices (`Price`) in minor units + currency |
+| Invoices | `Invoice` + `InvoiceLine` rows with a price snapshot at issue time |
+| Discounts | Public `PromoCode` and private `DiscountGrant` |
+| Payments | Stripe Checkout / Plisio invoice, separate attempts and logs |
+| Balance | Append-only `BalanceLedger`, balance calculation per currency |
+| Access | `UserEntitlement` after payment (no rigid business logic in the package) |
+| Subscriptions | `StripeSubscription` — recurring only through Stripe |
+| Audit | `PaymentAttempt`, `WebhookEvent`, `ProviderTransaction` |
+| Cron | `dsp_sync_invoices` — poll provider APIs; `dsp_expire_invoices` — TTL pending |
+| Scheduling | `DJANGO_STRIPE_PLISIO_CRON` + `build_cronjobs()` for django-crontab |
 
 ---
 
-## Архитектура
+## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph catalog [Каталог]
+    subgraph catalog [Catalog]
         Product --> Price
     end
 
@@ -350,45 +350,45 @@ flowchart TD
     User --> StripeSubscription
 ```
 
-**Поток оплаты (упрощённо):**
+**Payment flow (simplified):**
 
-1. Создаётся `Invoice` (с опциональной скидкой).
-2. `create_checkout()` создаёт `PaymentAttempt` и сессию у провайдера (Stripe / Plisio).
-3. Пользователь платит на стороне провайдера.
-4. Webhook приходит в `/billing/webhooks/...` → идемпотентная обработка → `mark_invoice_paid()`.
-5. *(опционально)* Cron `dsp_sync_invoices` догоняет оплату, если webhook потерян.
-6. Записывается `BalanceLedger`, при необходимости `UserEntitlement`, шлётся сигнал `invoice_paid`.
-7. *(опционально)* Cron `dsp_expire_invoices` переводит просроченный pending в `expired` по `expires_at`.
+1. An `Invoice` is created (with optional discount).
+2. `create_checkout()` creates a `PaymentAttempt` and a session at the provider (Stripe / Plisio).
+3. The user pays on the provider side.
+4. Webhook arrives at `/billing/webhooks/...` → idempotent processing → `mark_invoice_paid()`.
+5. *(optional)* Cron `dsp_sync_invoices` catches up payment if the webhook was lost.
+6. `BalanceLedger` is recorded, `UserEntitlement` if needed, `invoice_paid` signal is sent.
+7. *(optional)* Cron `dsp_expire_invoices` moves overdue pending to `expired` by `expires_at`.
 
 ---
 
-## Структура пакета
+## Package structure
 
 ```
 src/django_stripe_plisio/
-├── __init__.py          # версия пакета
-├── apps.py              # корневой AppConfig, подключение signals при ready()
-├── conf.py              # чтение DJANGO_STRIPE_PLISIO_* из settings
-├── cron.py              # build_cronjobs() для django-crontab
+├── __init__.py          # package version
+├── apps.py              # root AppConfig, signals connected on ready()
+├── conf.py              # reading DJANGO_STRIPE_PLISIO_* from settings
+├── cron.py              # build_cronjobs() for django-crontab
 ├── signals.py           # invoice_paid, payment_failed, balance_changed, entitlement_granted
-├── api.py               # публичный Python API (реэкспорт сервисов)
-├── urls.py              # корневые URL: API (если установлен DRF) + webhooks
+├── api.py               # public Python API (re-export of services)
+├── urls.py              # root URLs: API (if DRF installed) + webhooks
 │
-├── billing/             # домен биллинга (app label: dsp_billing)
-│   ├── models.py        # Product, Price, Invoice, скидки, ledger, entitlements
-│   ├── enums.py         # статусы, провайдеры, типы скидок и ledger
-│   ├── services.py      # create_invoice, скидки, ledger, mark_invoice_paid, expire_pending_invoices
+├── billing/             # billing domain (app label: dsp_billing)
+│   ├── models.py        # Product, Price, Invoice, discounts, ledger, entitlements
+│   ├── enums.py         # statuses, providers, discount and ledger types
+│   ├── services.py      # create_invoice, discounts, ledger, mark_invoice_paid, expire_pending_invoices
 │   ├── management/commands/
 │   │   ├── dsp_expire_invoices.py
 │   │   └── dsp_sync_invoices.py
-│   ├── admin.py         # админка биллинга
+│   ├── admin.py         # billing admin
 │   └── migrations/
 │
-├── payments/            # платежи и webhooks (app label: dsp_payments)
+├── payments/            # payments and webhooks (app label: dsp_payments)
 │   ├── models.py        # PaymentAttempt, WebhookEvent, ProviderTransaction, StripeSubscription
-│   ├── enums.py         # статусы попыток, webhook, подписки
+│   ├── enums.py         # attempt, webhook, subscription statuses
 │   ├── services/
-│   │   ├── base.py      # абстрактный BasePaymentProvider
+│   │   ├── base.py      # abstract BasePaymentProvider
 │   │   ├── stripe_service.py
 │   │   ├── plisio_service.py
 │   │   └── invoice_sync.py   # sync_pending_invoices()
@@ -398,59 +398,59 @@ src/django_stripe_plisio/
 │   ├── admin.py
 │   └── migrations/
 │
-└── api/                 # REST API (требует extra [api])
+└── api/                 # REST API (requires extra [api])
     ├── serializers.py
     ├── views.py
     └── urls.py
 
-demo_project/            # пример подключения и окружение для pytest
-tests/                   # тесты пакета
+demo_project/            # integration example and pytest environment
+tests/                   # package tests
 ```
 
-### Назначение ключевых модулей
+### Key module responsibilities
 
-| Файл | За что отвечает |
+| File | Responsibility |
 |------|-----------------|
-| `conf.py` | Единая точка доступа к настройкам (`PackageSettings`): ключи API, валюты, cron, sync |
-| `cron.py` | `build_cronjobs()` — сборка `CRONJOBS` для django-crontab |
-| `billing/services.py` | Бизнес-логика счетов, расчёт скидок, ledger, перевод invoice в `paid` |
-| `payments/services/` | Интеграция со Stripe и Plisio: checkout, verify webhook, обработка событий |
-| `payments/views/webhooks.py` | HTTP-endpoints без CSRF для callback провайдеров |
-| `api.py` | Стабильный публичный API для импорта из кода потребителя |
-| `api/*` | DRF views/serializers; не загружается, если DRF не установлен |
+| `conf.py` | Single access point for settings (`PackageSettings`): API keys, currencies, cron, sync |
+| `cron.py` | `build_cronjobs()` — building `CRONJOBS` for django-crontab |
+| `billing/services.py` | Invoice business logic, discount calculation, ledger, moving invoice to `paid` |
+| `payments/services/` | Stripe and Plisio integration: checkout, webhook verify, event handling |
+| `payments/views/webhooks.py` | HTTP endpoints without CSRF for provider callbacks |
+| `api.py` | Stable public API for consumer code imports |
+| `api/*` | DRF views/serializers; not loaded if DRF is not installed |
 
 ---
 
-## Установка
+## Installation
 
 ```bash
-# Минимум: модели, admin, services, webhooks
+# Minimum: models, admin, services, webhooks
 pip install django-stripe-plisio
 
-# С REST API
+# With REST API
 pip install django-stripe-plisio[api]
 
-# С django-crontab (расписание из DJANGO_STRIPE_PLISIO_CRON)
+# With django-crontab (schedule from DJANGO_STRIPE_PLISIO_CRON)
 pip install django-stripe-plisio[cron]
 
 # API + cron
 pip install django-stripe-plisio[api,cron]
 
-# Для разработки
+# For development
 pip install -e ".[dev]"
 ```
 
-**Зависимости:**
+**Dependencies:**
 
 - `Django>=5.0`
 - `stripe` — Stripe API
 - `requests` — Plisio HTTP API
-- `djangorestframework` — только с extra `[api]`
-- `django-crontab` — только с extra `[cron]`
+- `djangorestframework` — only with extra `[api]`
+- `django-crontab` — only with extra `[cron]`
 
 ---
 
-## Подключение в проект
+## Integration in a project
 
 ### 1. `INSTALLED_APPS`
 
@@ -463,7 +463,7 @@ INSTALLED_APPS = [
 ]
 ```
 
-### 2. Миграции
+### 2. Migrations
 
 ```bash
 python manage.py migrate dsp_billing
@@ -480,49 +480,49 @@ urlpatterns = [
 ]
 ```
 
-После подключения:
+After integration:
 
-| Путь | Назначение |
+| Path | Purpose |
 |------|------------|
-| `/billing/products/` | Список продуктов (DRF) |
-| `/billing/prices/` | Список цен |
-| `/billing/invoices/` | Список / создание счетов |
-| `/billing/invoices/<id>/` | Детали счёта |
+| `/billing/products/` | Product list (DRF) |
+| `/billing/prices/` | Price list |
+| `/billing/invoices/` | Invoice list / creation |
+| `/billing/invoices/<id>/` | Invoice details |
 | `/billing/payments/stripe/checkout/` | Stripe Checkout Session |
 | `/billing/payments/plisio/invoice/` | Plisio crypto invoice |
-| `/billing/balance/ledger/` | Проводки баланса пользователя |
-| `/billing/webhooks/stripe/` | Webhook Stripe |
-| `/billing/webhooks/plisio/` | Callback Plisio |
+| `/billing/balance/ledger/` | User balance ledger entries |
+| `/billing/webhooks/stripe/` | Stripe webhook |
+| `/billing/webhooks/plisio/` | Plisio callback |
 
-> REST-маршруты доступны только при установленном `djangorestframework`.
+> REST routes are available only when `djangorestframework` is installed.
 
-### 4. Пользователь
+### 4. User
 
-Пакет **не** создаёт свою модель `User`. Используется `settings.AUTH_USER_MODEL` из вашего проекта.
+The package does **not** create its own `User` model. It uses `settings.AUTH_USER_MODEL` from your project.
 
 ---
 
-## Настройки
+## Configuration
 
-Все константы читаются через префикс `DJANGO_STRIPE_PLISIO_` (см. `conf.py` → `PackageSettings`).
+All constants are read with the `DJANGO_STRIPE_PLISIO_` prefix (see `conf.py` → `PackageSettings`).
 
-| Константа | Обязательность | Описание |
+| Constant | Required | Description |
 |-----------|----------------|----------|
-| `DJANGO_STRIPE_PLISIO_STRIPE_SECRET_KEY` | для Stripe | Secret key (`sk_...`) |
-| `DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET` | для webhooks Stripe | Signing secret (`whsec_...`) |
-| `DJANGO_STRIPE_PLISIO_PLISIO_API_KEY` | для Plisio | API key Plisio |
-| `DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET` | для Plisio | Секрет проверки `verify_hash` в callback |
-| `DJANGO_STRIPE_PLISIO_DEFAULT_CURRENCY` | рекомендуется | Валюта по умолчанию, напр. `"USD"` |
-| `DJANGO_STRIPE_PLISIO_ALLOWED_CURRENCIES` | рекомендуется | Список разрешённых валют, напр. `["USD", "EUR", "RUB"]` |
-| `DJANGO_STRIPE_PLISIO_SUCCESS_URL` | для checkout | URL после успешной оплаты |
-| `DJANGO_STRIPE_PLISIO_CANCEL_URL` | для checkout | URL при отмене |
-| `DJANGO_STRIPE_PLISIO_USER_ID_FIELD` | опционально | Поле user для metadata (по умолчанию `"pk"`) |
-| `DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS` | опционально | TTL pending-счёта → `expires_at` |
-| `DJANGO_STRIPE_PLISIO_CRON` | для cron | Расписание задач `sync_invoices` / `expire_invoices` |
-| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE` | опционально | Лимит счетов за прогон sync (по умолчанию `100`) |
-| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_PROVIDERS` | опционально | `["stripe", "plisio"]` или все, если не задано |
+| `DJANGO_STRIPE_PLISIO_STRIPE_SECRET_KEY` | for Stripe | Secret key (`sk_...`) |
+| `DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET` | for Stripe webhooks | Signing secret (`whsec_...`) |
+| `DJANGO_STRIPE_PLISIO_PLISIO_API_KEY` | for Plisio | Plisio API key |
+| `DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET` | for Plisio | Secret for `verify_hash` check in callback |
+| `DJANGO_STRIPE_PLISIO_DEFAULT_CURRENCY` | recommended | Default currency, e.g. `"USD"` |
+| `DJANGO_STRIPE_PLISIO_ALLOWED_CURRENCIES` | recommended | List of allowed currencies, e.g. `["USD", "EUR", "RUB"]` |
+| `DJANGO_STRIPE_PLISIO_SUCCESS_URL` | for checkout | URL after successful payment |
+| `DJANGO_STRIPE_PLISIO_CANCEL_URL` | for checkout | URL on cancellation |
+| `DJANGO_STRIPE_PLISIO_USER_ID_FIELD` | optional | User field for metadata (default `"pk"`) |
+| `DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS` | optional | Pending invoice TTL → `expires_at` |
+| `DJANGO_STRIPE_PLISIO_CRON` | for cron | Schedule for `sync_invoices` / `expire_invoices` tasks |
+| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE` | optional | Invoice limit per sync run (default `100`) |
+| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_PROVIDERS` | optional | `["stripe", "plisio"]` or all if not set |
 
-Пример:
+Example:
 
 ```python
 DJANGO_STRIPE_PLISIO_STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY")
@@ -537,13 +537,13 @@ DJANGO_STRIPE_PLISIO_CANCEL_URL = "https://example.com/billing/cancel"
 
 ---
 
-## Периодические задачи (cron)
+## Scheduled tasks (cron)
 
-Webhooks — основной способ узнать об оплате. **Cron** — резерв: опрос API провайдера и локальное истечение pending по TTL.
+Webhooks are the primary way to learn about payment. **Cron** is a fallback: polling the provider API and local expiration of pending by TTL.
 
 ```mermaid
 flowchart TD
-    subgraph cronFlow [Рекомендуемый порядок в cron]
+    subgraph cronFlow [Recommended cron order]
         S[dsp_sync_invoices] --> E[dsp_expire_invoices]
     end
     S --> StripeAPI[Stripe Session.retrieve]
@@ -555,20 +555,20 @@ flowchart TD
 
 ### Management commands
 
-| Команда | Назначение |
+| Command | Purpose |
 |---------|------------|
-| `python manage.py dsp_sync_invoices` | Опрос API: pending-счета с непустым `external_id` |
-| `python manage.py dsp_expire_invoices` | Без API: `pending` + `expires_at < now` → `expired` |
+| `python manage.py dsp_sync_invoices` | API polling: pending invoices with non-empty `external_id` |
+| `python manage.py dsp_expire_invoices` | Without API: `pending` + `expires_at < now` → `expired` |
 
-**Порядок обязателен:** сначала **sync**, потом **expire**. Иначе счёт, оплаченный с задержкой, может стать `expired` по TTL до того, как sync увидит оплату у провайдера.
+**Order is mandatory:** **sync** first, then **expire**. Otherwise an invoice paid with a delay may become `expired` by TTL before sync sees the payment at the provider.
 
 #### `dsp_sync_invoices`
 
-- Читает `DJANGO_STRIPE_PLISIO_CRON["sync_invoices"]["enabled"]`. Если `False` — предупреждение в stdout и **exit 0** (cron не падает).
-- Опции: `--dry-run` (без записи в БД), `--batch-size N` (перекрывает `INVOICE_SYNC_BATCH_SIZE`).
-- В конце печатает сводку: `checked`, `paid`, `expired`, `cancelled`, `skipped`, `errors`.
+- Reads `DJANGO_STRIPE_PLISIO_CRON["sync_invoices"]["enabled"]`. If `False` — warning to stdout and **exit 0** (cron does not fail).
+- Options: `--dry-run` (no DB writes), `--batch-size N` (overrides `INVOICE_SYNC_BATCH_SIZE`).
+- At the end prints a summary: `checked`, `paid`, `expired`, `cancelled`, `skipped`, `errors`.
 
-Пример вывода:
+Example output:
 
 ```text
 Sync done: checked=12 paid=2 expired=1 cancelled=0 skipped=0 errors=0
@@ -576,53 +576,53 @@ Sync done: checked=12 paid=2 expired=1 cancelled=0 skipped=0 errors=0
 
 #### `dsp_expire_invoices`
 
-- Не обращается к Stripe/Plisio.
-- Требует `INVOICE_PENDING_TTL_HOURS` при создании счёта (поле `expires_at`).
+- Does not contact Stripe/Plisio.
+- Requires `INVOICE_PENDING_TTL_HOURS` when creating an invoice (the `expires_at` field).
 
-### Что делает sync по провайдерам
+### What sync does per provider
 
-Обрабатываются только счета: `status=pending`, `external_id` не пустой. Идемпотентность — через `mark_invoice_paid` и уникальные `ProviderTransaction` (как у webhook).
+Only invoices with `status=pending` and non-empty `external_id` are processed. Idempotency — via `mark_invoice_paid` and unique `ProviderTransaction` (same as webhook).
 
-| Провайдер | API | Условие «оплачено» | Terminal без оплаты |
+| Provider | API | «Paid» condition | Terminal without payment |
 |-----------|-----|--------------------|---------------------|
-| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid` и `status=complete` | — (остаётся pending) |
+| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid` and `status=complete` | — (stays pending) |
 | **Plisio** | `GET /api/v1/operations/{txn_id}` | `completed`, `confirmed` | `expired` → invoice `expired`; `cancelled` → `cancelled` |
-| **Plisio** | — | `mismatch` | **не** помечается paid (только log, `skipped`) |
+| **Plisio** | — | `mismatch` | **not** marked paid (log only, `skipped`) |
 
-Ограничение: sync **не** опрашивает подписки Stripe (`StripeSubscription`) — только checkout-сессии счетов.
+Limitation: sync does **not** poll Stripe subscriptions (`StripeSubscription`) — only invoice checkout sessions.
 
-### Настройки
+### Settings
 
-| Константа | По умолчанию | Описание |
+| Constant | Default | Description |
 |-----------|--------------|----------|
-| `DJANGO_STRIPE_PLISIO_CRON` | `{}` | Словарь задач: `sync_invoices`, `expire_invoices` |
-| `…CRON["sync_invoices"]["enabled"]` | `False` | Включить `dsp_sync_invoices` |
-| `…CRON["sync_invoices"]["schedule"]` | — | Cron-выражение (5 полей, django-crontab) |
-| `…CRON["expire_invoices"]["enabled"]` | `False` | Включить `dsp_expire_invoices` |
-| `…CRON["expire_invoices"]["schedule"]` | — | Cron-выражение |
-| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE` | `100` | Лимит счетов за один прогон |
-| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_PROVIDERS` | все | Напр. `["stripe"]` или `["plisio"]` |
+| `DJANGO_STRIPE_PLISIO_CRON` | `{}` | Task dictionary: `sync_invoices`, `expire_invoices` |
+| `…CRON["sync_invoices"]["enabled"]` | `False` | Enable `dsp_sync_invoices` |
+| `…CRON["sync_invoices"]["schedule"]` | — | Cron expression (5 fields, django-crontab) |
+| `…CRON["expire_invoices"]["enabled"]` | `False` | Enable `dsp_expire_invoices` |
+| `…CRON["expire_invoices"]["schedule"]` | — | Cron expression |
+| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE` | `100` | Invoice limit per run |
+| `DJANGO_STRIPE_PLISIO_INVOICE_SYNC_PROVIDERS` | all | E.g. `["stripe"]` or `["plisio"]` |
 
-Пример `settings.py`:
+Example `settings.py`:
 
 ```python
 DJANGO_STRIPE_PLISIO_CRON = {
     "sync_invoices": {
         "enabled": True,
-        "schedule": "*/10 * * * *",  # каждые 10 минут
+        "schedule": "*/10 * * * *",  # every 10 minutes
     },
     "expire_invoices": {
         "enabled": True,
-        "schedule": "5 * * * *",  # в :05 каждого часа — после sync
+        "schedule": "5 * * * *",  # at :05 each hour — after sync
     },
 }
 DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE = 100
 DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS = 24
 ```
 
-Чтение в коде: `PackageSettings.cron_config()`, `cron_task_enabled()`, `cron_task_schedule()`.
+Reading in code: `PackageSettings.cron_config()`, `cron_task_enabled()`, `cron_task_schedule()`.
 
-### Программный вызов (без management command)
+### Programmatic invocation (without management command)
 
 ```python
 from django_stripe_plisio.payments.services.invoice_sync import sync_pending_invoices
@@ -631,15 +631,15 @@ result = sync_pending_invoices(batch_size=50, dry_run=False)
 # result.checked, result.paid, result.expired_remote, ...
 ```
 
-Истечение по TTL:
+TTL expiration:
 
 ```python
 from django_stripe_plisio.billing.services import expire_pending_invoices
 
-expire_pending_invoices()  # -> int, количество обновлённых счетов
+expire_pending_invoices()  # -> int, number of updated invoices
 ```
 
-### django-crontab (рекомендуется)
+### django-crontab (recommended)
 
 ```bash
 pip install "django-stripe-plisio[cron]"
@@ -656,120 +656,120 @@ INSTALLED_APPS = [
 
 from django_stripe_plisio.cron import build_cronjobs
 
-# Только задачи пакета с enabled=True и непустым schedule
+# Only package tasks with enabled=True and non-empty schedule
 CRONJOBS = build_cronjobs()
 
-# Свои задачи проекта — вторым аргументом:
+# Your project tasks — as second argument:
 # CRONJOBS = build_cronjobs(extra=[
 #     ("0 3 * * *", "myapp.tasks.cleanup"),
 # ])
 ```
 
-Деплой расписания на сервер:
+Deploy schedule to the server:
 
 ```bash
 python manage.py crontab add
 python manage.py crontab show
-python manage.py crontab remove   # при смене CRONJOBS — remove, затем add
+python manage.py crontab remove   # when CRONJOBS changes — remove, then add
 ```
 
-`build_cronjobs()` формирует кортежи:
+`build_cronjobs()` builds tuples:
 
 ```python
 ("*/10 * * * *", "django.core.management.call_command", ["dsp_sync_invoices"])
 ```
 
-Пакет **не** подменяет `CRONJOBS` в `AppConfig.ready()` — вызов `build_cronjobs()` в settings явный и предсказуемый.
+The package does **not** override `CRONJOBS` in `AppConfig.ready()` — calling `build_cronjobs()` in settings is explicit and predictable.
 
 ### system cron / Kubernetes
 
-Без `django-crontab`:
+Without `django-crontab`:
 
 ```cron
-# /etc/cron.d/billing — порядок: sync, затем expire
+# /etc/cron.d/billing — order: sync, then expire
 */10 * * * * www-data cd /app && python manage.py dsp_sync_invoices >> /var/log/dsp_sync.log 2>&1
 5 * * * * www-data cd /app && python manage.py dsp_expire_invoices >> /var/log/dsp_expire.log 2>&1
 ```
 
-Kubernetes CronJob — две Job с разным `schedule`; у sync более частый интервал, expire — с небольшим сдвигом после sync.
+Kubernetes CronJob — two Jobs with different `schedule`; sync has a more frequent interval, expire — with a small offset after sync.
 
-### Когда включать sync в prod
+### When to enable sync in prod
 
-| Ситуация | Рекомендация |
+| Situation | Recommendation |
 |----------|--------------|
-| Webhooks настроены и стабильны | Sync как страховка раз в 5–15 мин |
-| Plisio/Stripe за NAT, без публичного URL | Sync обязателен до появления webhook |
-| Высокая нагрузка, много pending | Уменьшить `INVOICE_SYNC_BATCH_SIZE`, чаще cron |
-| Только тестовый стенд | `enabled: False` или `--dry-run` |
+| Webhooks configured and stable | Sync as backup every 5–15 min |
+| Plisio/Stripe behind NAT, no public URL | Sync required until webhook is available |
+| High load, many pending | Reduce `INVOICE_SYNC_BATCH_SIZE`, run cron more often |
+| Test environment only | `enabled: False` or `--dry-run` |
 
 ---
 
-## Модели данных
+## Data models
 
 ### Billing (`django_stripe_plisio.billing`)
 
 #### `Product`
 
-Бизнес-продукт или тарифный план.
+Business product or pricing plan.
 
-| Поле | Описание |
+| Field | Description |
 |------|----------|
-| `code` | Уникальный slug (идентификатор в коде) |
-| `name`, `description` | Отображаемые название и описание |
-| `is_active` | Доступен ли для продажи |
-| `metadata` | Произвольный JSON для вашей логики |
+| `code` | Unique slug (identifier in code) |
+| `name`, `description` | Display name and description |
+| `is_active` | Available for sale |
+| `metadata` | Arbitrary JSON for your logic |
 
 #### `Price`
 
-Цена продукта. **Суммы только в minor units** (центы, копейки) + `currency`.
+Product price. **Amounts only in minor units** (cents, kopecks) + `currency`.
 
-| Поле | Описание |
+| Field | Description |
 |------|----------|
-| `product` | FK на `Product` |
-| `amount_minor` | Сумма в минимальных единицах |
+| `product` | FK to `Product` |
+| `amount_minor` | Amount in minor units |
 | `currency` | ISO 4217 (`USD`, `EUR`, …) |
 | `billing_period` | `one_time` \| `month` \| `year` |
-| `stripe_product_id`, `stripe_price_id` | Ссылки на объекты Stripe (опционально) |
+| `stripe_product_id`, `stripe_price_id` | Stripe object references (optional) |
 
 #### `Invoice`
 
-Счёт пользователю.
+Invoice to a user.
 
-| Поле | Описание |
+| Field | Description |
 |------|----------|
-| `user` | FK на `AUTH_USER_MODEL` |
+| `user` | FK to `AUTH_USER_MODEL` |
 | `status` | `draft`, `pending`, `paid`, `expired`, `cancelled`, `failed` |
-| `provider` | `stripe` или `plisio` — через какой канал оплачивается счёт |
-| `subtotal_minor`, `discount_minor`, `total_minor` | Суммы до/после скидки |
-| `payment_url` | Ссылка на оплату у провайдера |
-| `external_id` | ID сессии/транзакции у провайдера |
-| `paid_at`, `expires_at` | Время оплаты / истечения |
-| `metadata` | Ваши данные (order id, source, …) |
+| `provider` | `stripe` or `plisio` — payment channel for the invoice |
+| `subtotal_minor`, `discount_minor`, `total_minor` | Amounts before/after discount |
+| `payment_url` | Payment link at the provider |
+| `external_id` | Session/transaction ID at the provider |
+| `paid_at`, `expires_at` | Payment time / expiration |
+| `metadata` | Your data (order id, source, …) |
 
 #### `InvoiceLine`
 
-Строка счёта — **снимок** цены на момент выставления (изменение `Price` не меняет старые счета).
+Invoice line — **snapshot** of the price at issue time (changing `Price` does not affect old invoices).
 
 #### `PromoCode`
 
-Публичный промокод: процент или фиксированная скидка, лимиты использования, срок действия.
+Public promo code: percent or fixed discount, usage limits, validity period.
 
 #### `DiscountGrant`
 
-Приватная скидка конкретному пользователю (без кода). Может применяться автоматически при `create_invoice(..., use_private_grant=True)`.
+Private discount for a specific user (no code). Can be applied automatically on `create_invoice(..., use_private_grant=True)`.
 
 #### `InvoiceDiscount`
 
-Снимок применённой скидки на счёте (связь с `PromoCode` или `DiscountGrant`).
+Snapshot of the applied discount on the invoice (link to `PromoCode` or `DiscountGrant`).
 
 #### `BalanceLedger`
 
-Append-only журнал баланса. Типы: `credit`, `debit`, `refund`, `adjustment`, `promo`.  
-**Записи не редактируются** — корректировки только новой проводкой.
+Append-only balance journal. Types: `credit`, `debit`, `refund`, `adjustment`, `promo`.  
+**Entries are not edited** — corrections only via a new ledger entry.
 
 #### `UserEntitlement`
 
-Выданный доступ (период `active_from` / `active_until`). Создаётся после оплаты; ваша логика может слушать сигнал `entitlement_granted`.
+Granted access (period `active_from` / `active_until`). Created after payment; your logic can listen to the `entitlement_granted` signal.
 
 ---
 
@@ -777,56 +777,56 @@ Append-only журнал баланса. Типы: `credit`, `debit`, `refund`, 
 
 #### `PaymentAttempt`
 
-Каждая попытка оплаты: запрос/ответ провайдера, статус, ошибки.  
-Proxy-модели для admin: `StripePaymentAttempt`, `PlisioPaymentAttempt` (фильтр по `provider`).
+Each payment attempt: provider request/response, status, errors.  
+Proxy models for admin: `StripePaymentAttempt`, `PlisioPaymentAttempt` (filter by `provider`).
 
-| Статус | Значение |
+| Status | Meaning |
 |--------|----------|
-| `created` | Создана запись |
-| `pending` | Сессия/инвойс у провайдера создан |
-| `succeeded` | Успех (подтверждено webhook) |
-| `failed` | Ошибка API |
-| `cancelled` | Отменено |
+| `created` | Record created |
+| `pending` | Session/invoice created at provider |
+| `succeeded` | Success (confirmed by webhook) |
+| `failed` | API error |
+| `cancelled` | Cancelled |
 
 #### `WebhookEvent`
 
-Сырой webhook с **уникальным** `idempotency_key`. Повторная доставка не дублирует начисление.
+Raw webhook with a **unique** `idempotency_key`. Redelivery does not duplicate crediting.
 
 #### `ProviderTransaction`
 
-Нормализованная транзакция провайдера для сверки и отчётов. Уникальность: `(provider, external_id)`.
+Normalized provider transaction for reconciliation and reporting. Uniqueness: `(provider, external_id)`.
 
 #### `StripeSubscription`
 
-Stripe recurring subscription (только карты). Plisio **не** эмулирует автосписание — только разовые crypto invoice.
+Stripe recurring subscription (cards only). Plisio does **not** emulate auto-charge — only one-time crypto invoices.
 
 ---
 
-## Сервисный слой
+## Service layer
 
-### Публичный Python API (`django_stripe_plisio.api`)
+### Public Python API (`django_stripe_plisio.api`)
 
 ```python
 from django_stripe_plisio import api
 
-# Создать счёт
+# Create invoice
 invoice = api.create_invoice(
     user=request.user,
     price=price,
-    provider="stripe",       # или "plisio"
+    provider="stripe",       # or "plisio"
     quantity=1,
-    promo_code="SAVE10",     # опционально
+    promo_code="SAVE10",     # optional
     metadata={"order_id": "42"},
 )
 
-# Создать checkout у провайдера счёта
+# Create checkout at the invoice provider
 attempt = api.create_checkout(invoice)
-# attempt.payment_url — ссылка для редиректа пользователя
+# attempt.payment_url — link for user redirect
 
-# Применить промокод к pending-счёту
+# Apply promo code to pending invoice
 invoice = api.apply_promo(invoice, "SAVE10")
 
-# Приватная скидка
+# Private discount
 api.grant_private_discount(
     user,
     discount_type="percent",
@@ -834,7 +834,7 @@ api.grant_private_discount(
     note="VIP",
 )
 
-# Баланс и ручные проводки
+# Balance and manual ledger entries
 balance = api.get_user_balance(user, "USD")
 api.record_ledger_entry(
     user,
@@ -844,55 +844,55 @@ api.record_ledger_entry(
     note="Service charge",
 )
 
-# Вручную отметить оплату (обычно вызывается из webhook)
+# Manually mark as paid (usually called from webhook)
 api.mark_invoice_paid(invoice, external_id="cs_...")
 ```
 
-### `billing/services.py` (внутренние функции)
+### `billing/services.py` (internal functions)
 
-| Функция | Назначение |
+| Function | Purpose |
 |---------|------------|
-| `create_invoice` | Счёт + строки + скидка + пересчёт `total_minor` |
-| `apply_promo` | Промокод на существующий pending-счёт |
-| `calculate_discount_minor` | Расчёт скидки (percent / fixed) |
-| `grant_private_discount` | Создание `DiscountGrant` |
-| `get_user_balance` | `Sum(amount_minor)` по ledger |
-| `record_ledger_entry` | Новая проводка + сигнал `balance_changed` |
-| `mark_invoice_paid` | Статус `paid`, credit в ledger, entitlement, `invoice_paid` |
-| `expire_pending_invoices` | `pending` + просроченный `expires_at` → `expired` |
+| `create_invoice` | Invoice + lines + discount + `total_minor` recalculation |
+| `apply_promo` | Promo code on existing pending invoice |
+| `calculate_discount_minor` | Discount calculation (percent / fixed) |
+| `grant_private_discount` | Create `DiscountGrant` |
+| `get_user_balance` | `Sum(amount_minor)` over ledger |
+| `record_ledger_entry` | New ledger entry + `balance_changed` signal |
+| `mark_invoice_paid` | Status `paid`, credit in ledger, entitlement, `invoice_paid` |
+| `expire_pending_invoices` | `pending` + expired `expires_at` → `expired` |
 
-Синхронизация с провайдером: `payments.services.invoice_sync.sync_pending_invoices()`.
+Provider sync: `payments.services.invoice_sync.sync_pending_invoices()`.
 
 ---
 
-## Платёжные провайдеры
+## Payment providers
 
-Общий интерфейс: `BasePaymentProvider` (`create_checkout`, `verify_webhook`, `handle_webhook_event`, `sync_invoice_status`).
+Common interface: `BasePaymentProvider` (`create_checkout`, `verify_webhook`, `handle_webhook_event`, `sync_invoice_status`).
 
-Фабрика: `payments.services.get_payment_service(provider)` / `create_checkout(invoice)`.
+Factory: `payments.services.get_payment_service(provider)` / `create_checkout(invoice)`.
 
 ### Stripe (`StripePaymentService`)
 
-- Создаёт **Checkout Session** (`stripe.checkout.Session.create`).
-- Режим `payment` для `one_time`, `subscription` для `month` / `year`.
-- Если у `Price` задан `stripe_price_id`, используется готовая цена Stripe.
+- Creates **Checkout Session** (`stripe.checkout.Session.create`).
+- Mode `payment` for `one_time`, `subscription` for `month` / `year`.
+- If `Price` has `stripe_price_id`, the existing Stripe price is used.
 - Webhook: `checkout.session.completed` → `mark_invoice_paid`.
-- Cron: `sync_invoice_status()` → `Session.retrieve` → та же логика, что webhook (`_apply_checkout_session_paid`).
+- Cron: `sync_invoice_status()` → `Session.retrieve` → same logic as webhook (`_apply_checkout_session_paid`).
 
-**Настройка webhook в Stripe Dashboard:**
+**Webhook setup in Stripe Dashboard:**
 
 - URL: `https://your-domain/billing/webhooks/stripe/`
-- Событие: `checkout.session.completed`
+- Event: `checkout.session.completed`
 - Secret → `DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET`
 
 ### Plisio (`PlisioPaymentService`)
 
-- Создаёт crypto invoice через `GET https://api.plisio.net/api/v1/invoices/new`.
-- Callback проверяется по `verify_hash` (SHA1 от sorted query + secret).
-- Статусы `completed` / `confirmed` → оплата засчитана.
-- Cron: `GET /operations/{txn_id}`; `mismatch` не переводит счёт в `paid`.
+- Creates crypto invoice via `GET https://api.plisio.net/api/v1/invoices/new`.
+- Callback verified via `verify_hash` (SHA1 of sorted query + secret).
+- Statuses `completed` / `confirmed` → payment counted.
+- Cron: `GET /operations/{txn_id}`; `mismatch` does not move invoice to `paid`.
 
-**Callback URL в кабинете Plisio:**
+**Callback URL in Plisio dashboard:**
 
 - `https://your-domain/billing/webhooks/plisio/`
 
@@ -900,16 +900,16 @@ api.mark_invoice_paid(invoice, external_id="cs_...")
 
 ## REST API
 
-Требует `pip install django-stripe-plisio[api]` и аутентификацию DRF (в demo — `SessionAuthentication`).
+Requires `pip install django-stripe-plisio[api]` and DRF authentication (in demo — `SessionAuthentication`).
 
-### Каталог
+### Catalog
 
 ```http
 GET /billing/products/
 GET /billing/prices/
 ```
 
-### Счета
+### Invoices
 
 ```http
 GET  /billing/invoices/
@@ -928,18 +928,18 @@ GET  /billing/invoices/{id}/
 }
 ```
 
-Пользователь — из `request.user`; чужие счета не видны.
+User — from `request.user`; other users' invoices are not visible.
 
-### Оплата
+### Payment
 
 ```http
 POST /billing/payments/stripe/checkout/
 POST /billing/payments/plisio/invoice/
 ```
 
-**Body:** `{ "invoice_id": 123 }` — provider должен совпадать с `invoice.provider`.
+**Body:** `{ "invoice_id": 123 }` — provider must match `invoice.provider`.
 
-### Баланс
+### Balance
 
 ```http
 GET /billing/balance/ledger/?currency=USD
@@ -949,20 +949,20 @@ GET /billing/balance/ledger/?currency=USD
 
 ## Webhooks
 
-| Endpoint | Провайдер | CSRF |
+| Endpoint | Provider | CSRF |
 |----------|-----------|------|
-| `POST /billing/webhooks/stripe/` | Stripe | отключён |
-| `POST /billing/webhooks/plisio/` | Plisio | отключён |
+| `POST /billing/webhooks/stripe/` | Stripe | disabled |
+| `POST /billing/webhooks/plisio/` | Plisio | disabled |
 
-**Идемпотентность:** ключи вида `stripe:{event_id}` и `plisio:{txn_id}:{status}`. Повтор не вызывает повторное начисление баланса.
+**Idempotency:** keys like `stripe:{event_id}` and `plisio:{txn_id}:{status}`. Retry does not cause duplicate balance crediting.
 
-**Резерв:** периодический `dsp_sync_invoices` использует те же `mark_invoice_paid` / обновления статуса — повторный sync безопасен.
+**Fallback:** periodic `dsp_sync_invoices` uses the same `mark_invoice_paid` / status updates — repeated sync is safe.
 
 ---
 
-## Сигналы
+## Signals
 
-Подключение в `AppConfig.ready()` пакета. Импорт: `django_stripe_plisio.signals`.
+Connected in the package's `AppConfig.ready()`. Import: `django_stripe_plisio.signals`.
 
 ```python
 from django.dispatch import receiver
@@ -970,7 +970,7 @@ from django_stripe_plisio.signals import invoice_paid, entitlement_granted
 
 @receiver(invoice_paid)
 def on_invoice_paid(sender, invoice, **kwargs):
-  # ваша логика: письмо, активация фичи, CRM, …
+  # your logic: email, feature activation, CRM, …
   ...
 
 @receiver(entitlement_granted)
@@ -978,29 +978,29 @@ def on_entitlement(sender, entitlement, invoice, **kwargs):
   ...
 ```
 
-| Сигнал | Когда |
+| Signal | When |
 |--------|-------|
-| `invoice_paid` | Счёт переведён в `paid` |
-| `payment_failed` | Ошибка создания checkout |
-| `balance_changed` | Новая запись в `BalanceLedger` |
-| `entitlement_granted` | Создан `UserEntitlement` |
+| `invoice_paid` | Invoice moved to `paid` |
+| `payment_failed` | Checkout creation error |
+| `balance_changed` | New entry in `BalanceLedger` |
+| `entitlement_granted` | `UserEntitlement` created |
 
 ---
 
 ## Django Admin
 
-Зарегистрированы все основные модели.
+All main models are registered.
 
-- **Invoice** — inline строк и скидок, фильтры по `provider`, `status`, `currency`.
-- **PaymentAttempt** — общий список + отдельные proxy **Stripe** / **Plisio**.
-- **BalanceLedger** — только чтение (без edit/delete).
-- **WebhookEvent** — readonly `payload` для аудита.
+- **Invoice** — inline lines and discounts, filters by `provider`, `status`, `currency`.
+- **PaymentAttempt** — general list + separate proxy **Stripe** / **Plisio**.
+- **BalanceLedger** — read-only (no edit/delete).
+- **WebhookEvent** — readonly `payload` for audit.
 
 ---
 
-## Типовые сценарии
+## Common scenarios
 
-### Разовая оплата тарифа (Stripe)
+### One-time plan payment (Stripe)
 
 ```python
 price = Price.objects.get(product__code="pro", currency="USD")
@@ -1009,27 +1009,27 @@ attempt = api.create_checkout(invoice)
 return redirect(attempt.payment_url)
 ```
 
-### Пополнение баланса криптой (Plisio)
+### Balance top-up with crypto (Plisio)
 
 ```python
 invoice = api.create_invoice(user, price, provider="plisio")
 attempt = api.create_checkout(invoice)
-# UI показывает attempt.payment_url или QR из ответа Plisio
+# UI shows attempt.payment_url or QR from Plisio response
 ```
 
-### Промокод + приватная скидка
+### Promo code + private discount
 
-- Промокод: `create_invoice(..., promo_code="WELCOME")`.
-- Приватная: `grant_private_discount(user, ...)` — применится автоматически, если промокод не передан.
+- Promo code: `create_invoice(..., promo_code="WELCOME")`.
+- Private: `grant_private_discount(user, ...)` — applied automatically if no promo code is passed.
 
-### Подписка Stripe
+### Stripe subscription
 
-Создайте `Price` с `billing_period=month` (или `year`) и при checkout Stripe откроет subscription mode. Состояние хранится в `StripeSubscription` (обновление из webhook можно расширить в вашем проекте).
+Create a `Price` with `billing_period=month` (or `year`) and on checkout Stripe opens subscription mode. State is stored in `StripeSubscription` (webhook updates can be extended in your project).
 
-### Cron: webhooks + догонка статусов
+### Cron: webhooks + status catch-up
 
 ```python
-# settings.py — см. раздел «Периодические задачи»
+# settings.py — see «Scheduled tasks» section
 DJANGO_STRIPE_PLISIO_CRON = {
     "sync_invoices": {"enabled": True, "schedule": "*/10 * * * *"},
     "expire_invoices": {"enabled": True, "schedule": "15 * * * *"},
@@ -1042,7 +1042,7 @@ pip install "django-stripe-plisio[cron]"
 python manage.py crontab add
 ```
 
-Проверка вручную:
+Manual check:
 
 ```bash
 python manage.py dsp_sync_invoices --dry-run
@@ -1052,22 +1052,22 @@ python manage.py dsp_expire_invoices
 
 ---
 
-## Инварианты и ограничения
+## Invariants and constraints
 
-1. **Деньги** — только `amount_minor` + `currency`, без `float`.
-2. **Ledger** — append-only; исправления новой проводкой.
-3. **Invoice** — снимок цены в `InvoiceLine`; скидка в `InvoiceDiscount`.
-4. **Webhooks** — идемпотентны; `mark_invoice_paid` безопасен при повторе.
-5. **Plisio** — только разовые инвойсы, без recurring.
-6. **DRF** — опционален; без него работают models, admin, services, webhooks.
-7. **Cron** — `dsp_sync_invoices` перед `dsp_expire_invoices`; sync не отменяет сессии у провайдеров.
-8. **Бизнес-логика** — в пакете минимальна; расширяйте через signals и свои обработчики.
+1. **Money** — only `amount_minor` + `currency`, no `float`.
+2. **Ledger** — append-only; corrections via a new entry.
+3. **Invoice** — price snapshot in `InvoiceLine`; discount in `InvoiceDiscount`.
+4. **Webhooks** — idempotent; `mark_invoice_paid` safe on retry.
+5. **Plisio** — one-time invoices only, no recurring.
+6. **DRF** — optional; without it models, admin, services, webhooks work.
+7. **Cron** — `dsp_sync_invoices` before `dsp_expire_invoices`; sync does not cancel sessions at providers.
+8. **Business logic** — minimal in the package; extend via signals and your handlers.
 
 ---
 
-## Разработка и тесты
+## Development and testing
 
-### Demo-проект
+### Demo project
 
 ```bash
 pip install -e ".[dev]"
@@ -1076,9 +1076,9 @@ python manage.py migrate
 python manage.py runserver
 ```
 
-В PyCharm доступны run-конфигурации: **Demo: runserver**, **Demo: migrate**, **Tests: pytest**.
+PyCharm run configurations available: **Demo: runserver**, **Demo: migrate**, **Tests: pytest**.
 
-### Тесты
+### Tests
 
 ```bash
 pytest tests/ -v
@@ -1087,12 +1087,12 @@ mypy src/django_stripe_plisio
 python -m build
 ```
 
-### Структура репозитория
+### Repository structure
 
 ```
 django-stripe-plisio/
-├── src/django_stripe_plisio/   # исходники пакета
-├── demo_project/               # пример интеграции
+├── src/django_stripe_plisio/   # package source
+├── demo_project/               # integration example
 ├── tests/                      # pytest
 ├── pyproject.toml
 └── README.md
@@ -1100,6 +1100,6 @@ django-stripe-plisio/
 
 ---
 
-## Лицензия
+## License
 
 MIT
