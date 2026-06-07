@@ -23,13 +23,14 @@ dev = [
     "django-stripe-plisio[api]",
     "build>=1.2",
     "mypy>=1.11",
+    "types-requests>=2.31",
     "ruff>=0.6",
     "pytest>=8.0",
     "pytest-django>=4.8",
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/django-stripe-plisio"
+Homepage = "https://github.com/svalench/django-stripe-plisio"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -39,8 +40,8 @@ where = ["src"]
 "django_stripe_plisio.payments" = ["migrations/*.py"]
 
 [tool.pytest.ini_options]
-DJANGO_SETTINGS_MODULE = "demo_project.settings"
-pythonpath = ["src", "demo_project"]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.ruff]

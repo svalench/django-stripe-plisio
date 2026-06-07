@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class StripePaymentService(BasePaymentProvider):
-    provider = PaymentProvider.STRIPE
+    provider = "stripe"
 
     def __init__(self) -> None:
         stripe.api_key = PackageSettings.stripe_secret_key()
@@ -286,7 +286,7 @@ class StripePaymentService(BasePaymentProvider):
         invoice: Invoice | None,
         stripe_subscription_id: str,
         stripe_customer_id: str,
-        status: str = StripeSubscriptionStatus.ACTIVE,
+        status: str = "active",
         current_period_end: datetime | None = None,
         raw: dict | None = None,
     ) -> None:

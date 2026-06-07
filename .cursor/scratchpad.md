@@ -1,11 +1,13 @@
 # Scratchpad
 
-## Cron sync invoices (0.3.0)
+## GitHub Actions CI + PyPI publish
 
-- [x] PackageSettings CRON + sync batch/providers
-- [x] sync_pending_invoices, Stripe/Plisio sync_invoice_status
-- [x] dsp_sync_invoices command
-- [x] cron.build_cronjobs + [cron] extra
-- [x] tests, README, CHANGELOG
+- [x] tests/settings.py + tests/urls.py для pytest без demo_project
+- [x] pyproject.toml: pytest config, Homepage, types-requests
+- [x] __version__ = 0.3.0
+- [x] .github/workflows/ci.yml
+- [x] .github/workflows/publish.yml (release published, OIDC)
+- [x] mypy fixes (provider literals)
+- [x] pytest 30/30, ruff, mypy, build OK
 
 DONE

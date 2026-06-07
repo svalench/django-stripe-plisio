@@ -30,7 +30,7 @@ PLISIO_API_URL = "https://api.plisio.net/api/v1"
 
 
 class PlisioPaymentService(BasePaymentProvider):
-    provider = PaymentProvider.PLISIO
+    provider = "plisio"
 
     def _api_key(self) -> str:
         return PackageSettings.plisio_api_key()
