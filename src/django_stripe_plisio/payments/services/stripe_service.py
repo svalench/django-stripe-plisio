@@ -10,7 +10,7 @@ import stripe
 from django.db import transaction
 from django.utils import timezone
 
-from django_stripe_plisio.billing.enums import BillingPeriod, InvoiceStatus, PaymentProvider
+from django_stripe_plisio.billing.enums import BillingPeriod, InvoiceStatus
 from django_stripe_plisio.billing.models import Invoice, InvoiceLine
 from django_stripe_plisio.billing.services import mark_invoice_paid
 from django_stripe_plisio.billing.utils import user_external_id

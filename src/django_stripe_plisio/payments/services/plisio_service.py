@@ -12,7 +12,7 @@ import requests
 from django.db import transaction
 from django.utils import timezone
 
-from django_stripe_plisio.billing.enums import InvoiceStatus, PaymentProvider
+from django_stripe_plisio.billing.enums import InvoiceStatus
 from django_stripe_plisio.billing.models import Invoice
 from django_stripe_plisio.billing.money import minor_to_major_amount
 from django_stripe_plisio.billing.services import mark_invoice_paid
