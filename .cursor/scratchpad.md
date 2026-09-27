@@ -38,4 +38,6 @@
 - [x] найдено: `construct_event` (stripe 15) → 500 на подписанном webhook; исправлено на `verify_header` + tolerance, правило `.cursor/rules/webhook-verification.mdc`
 - [x] pytest 77/77 на SQLite и PostgreSQL, ruff, mypy, makemigrations --check, build + twine check
 - [x] версия 0.4.0 (pyproject, `__version__`, CHANGELOG)
-- [ ] push, CI, GitHub release 0.4.0 → PyPI
+- [x] push, CI (8/8 jobs), GitHub release 0.4.0 → PyPI, установка `django-stripe-plisio==0.4.0` из PyPI проверена
+
+DONE
