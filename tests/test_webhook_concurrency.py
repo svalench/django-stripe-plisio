@@ -24,6 +24,9 @@ def test_double_webhook_single_ledger():
                 "id": "cs_race",
                 "metadata": {"invoice_id": str(invoice.pk)},
                 "client_reference_id": str(invoice.pk),
+                "payment_status": "paid",
+                "amount_total": 500,
+                "currency": "usd",
             },
         },
     }

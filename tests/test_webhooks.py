@@ -32,6 +32,9 @@ def test_stripe_webhook_idempotent(paid_invoice):
                 "id": "cs_test",
                 "metadata": {"invoice_id": str(paid_invoice.pk)},
                 "client_reference_id": str(paid_invoice.pk),
+                "payment_status": "paid",
+                "amount_total": 500,
+                "currency": "usd",
             },
         },
     }

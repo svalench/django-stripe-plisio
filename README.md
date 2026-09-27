@@ -122,9 +122,9 @@ DJANGO_STRIPE_PLISIO_INVOICE_SYNC_BATCH_SIZE = 100
 | `STRIPE_SECRET_KEY` | Creating Checkout Session and polling status in cron |
 | `STRIPE_WEBHOOK_SECRET` | Stripe signature verification (required in prod) |
 | `PLISIO_API_KEY` | Creating crypto invoice and polling operation in cron |
-| `PLISIO_CALLBACK_SECRET` | Plisio `verify_hash` verification |
-| `PLISIO_WEBHOOK_URL` | Callback URL for Plisio API (`callback_url`) |
-| `SUCCESS_URL` / `CANCEL_URL` | User redirect after Stripe Checkout |
+| `PLISIO_CALLBACK_SECRET` | Plisio `verify_hash` verification — the shop **Secret key** from Plisio API settings (usually the same value as `PLISIO_API_KEY`) |
+| `PLISIO_WEBHOOK_URL` | Callback URL for Plisio API (`callback_url`); `json=true` is appended automatically |
+| `SUCCESS_URL` / `CANCEL_URL` | User redirect after Stripe Checkout; Plisio «back to site» buttons (`success_invoice_url` / `fail_invoice_url`) |
 | `REQUIRE_WEBHOOK_SECRET` | Reject webhooks without a secret (fail-closed) |
 | `ALLOWED_CURRENCIES` | Allowed currencies in invoices |
 | `INVOICE_PENDING_TTL_HOURS` | `expires_at` for pending + `dsp_expire_invoices` |
@@ -139,8 +139,8 @@ The primary channel for payment confirmation is the **webhook**. Without it, the
 
 | Provider | URL in provider dashboard | Event |
 |-----------|---------------------------|---------|
-| Stripe | `https://your-site.com/billing/webhooks/stripe/` | `checkout.session.completed` |
-| Plisio | `https://your-site.com/billing/webhooks/plisio/` | callback on `completed` status |
+| Stripe | `https://your-site.com/billing/webhooks/stripe/` | `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `customer.subscription.created` / `updated` / `deleted` |
+| Plisio | `https://your-site.com/billing/webhooks/plisio/` | callbacks on invoice status changes (`completed`, `mismatch`, `expired`, `cancelled`) |
 
 #### 1.4. Cron (fallback channel)
 
@@ -206,8 +206,11 @@ def buy_pro_plan(request):
 **What happens internally:**
 
 1. An **Invoice** (status `pending`) and an **InvoiceLine** row with a price snapshot appear in the database.
-2. If the promo code is valid — `total_minor` is recalculated, an **InvoiceDiscount** is created.
-3. A **PaymentAttempt** and `payment_url` link are created (Stripe Checkout or Plisio invoice).
+2. If the promo code is valid — `total_minor` is recalculated, an **InvoiceDiscount** is created. A pending invoice reserves one promo code use until it is paid or expires (`max_uses` counts paid + pending invoices).
+3. A **PaymentAttempt** and `payment_url` link are created (Stripe Checkout or Plisio invoice). Calling `create_checkout` again for the same invoice returns the already open session/invoice instead of creating a second payable one.
+4. An invoice with `total_minor == 0` (e.g. 100% promo) for a one-time price is marked paid immediately, without a provider.
+
+Errors: business errors (invalid promo code, inactive price, invoice not payable) raise `BillingError` (a `ValueError` subclass); provider failures raise `PaymentProviderError` — the failed `PaymentAttempt` is saved and available as `exc.attempt`.
 
 The same scenario via REST API (if the frontend is Vue/React):
 
@@ -370,8 +373,8 @@ src/django_stripe_plisio/
 ├── apps.py              # root AppConfig, signals connected on ready()
 ├── conf.py              # reading DJANGO_STRIPE_PLISIO_* from settings
 ├── cron.py              # build_cronjobs() for django-crontab
-├── signals.py           # invoice_paid, payment_failed, balance_changed, entitlement_granted
-├── api.py               # public Python API (re-export of services)
+├── signals.py           # invoice_paid, payment_failed, balance_changed, entitlement_granted, …
+├── exceptions.py        # BillingError, PaymentProviderError, WebhookVerificationError
 ├── urls.py              # root URLs: API (if DRF installed) + webhooks
 │
 ├── billing/             # billing domain (app label: dsp_billing)
@@ -398,8 +401,9 @@ src/django_stripe_plisio/
 │   ├── admin.py
 │   └── migrations/
 │
-└── api/                 # REST API (requires extra [api])
-    ├── serializers.py
+└── api/
+    ├── __init__.py      # public Python API (re-export of services), no DRF dependency
+    ├── serializers.py   # REST API below requires extra [api]
     ├── views.py
     └── urls.py
 
@@ -416,8 +420,8 @@ tests/                   # package tests
 | `billing/services.py` | Invoice business logic, discount calculation, ledger, moving invoice to `paid` |
 | `payments/services/` | Stripe and Plisio integration: checkout, webhook verify, event handling |
 | `payments/views/webhooks.py` | HTTP endpoints without CSRF for provider callbacks |
-| `api.py` | Stable public API for consumer code imports |
-| `api/*` | DRF views/serializers; not loaded if DRF is not installed |
+| `api/__init__.py` | Stable public API for consumer code imports (`from django_stripe_plisio import api`) |
+| `api/views.py`, `api/serializers.py`, `api/urls.py` | DRF views/serializers; not loaded if DRF is not installed |
 
 ---
 
@@ -442,7 +446,7 @@ pip install -e ".[dev]"
 
 **Dependencies:**
 
-- `Django>=5.0`
+- `Django>=5.2`
 - `stripe` — Stripe API
 - `requests` — Plisio HTTP API
 - `djangorestframework` — only with extra `[api]`
@@ -565,7 +569,8 @@ flowchart TD
 #### `dsp_sync_invoices`
 
 - Reads `DJANGO_STRIPE_PLISIO_CRON["sync_invoices"]["enabled"]`. If `False` — warning to stdout and **exit 0** (cron does not fail).
-- Options: `--dry-run` (no DB writes), `--batch-size N` (overrides `INVOICE_SYNC_BATCH_SIZE`).
+- Options: `--dry-run` (no DB writes), `--batch-size N` (overrides `INVOICE_SYNC_BATCH_SIZE`), `--force` (manual run even when the task is disabled).
+- Each invoice is processed in its own transaction: an error on one invoice does not affect the others, and provider HTTP calls do not hold locks for the whole batch.
 - At the end prints a summary: `checked`, `paid`, `expired`, `cancelled`, `skipped`, `errors`.
 
 Example output:
@@ -585,9 +590,9 @@ Only invoices with `status=pending` and non-empty `external_id` are processed. I
 
 | Provider | API | «Paid» condition | Terminal without payment |
 |-----------|-----|--------------------|---------------------|
-| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid` and `status=complete` | — (stays pending) |
-| **Plisio** | `GET /api/v1/operations/{txn_id}` | `completed`, `confirmed` | `expired` → invoice `expired`; `cancelled` → `cancelled` |
-| **Plisio** | — | `mismatch` | **not** marked paid (log only, `skipped`) |
+| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid` and `status=complete`, `amount_total`/`currency` match the invoice | session `expired` → attempt `cancelled`, invoice stays `pending` and can be paid with a new checkout |
+| **Plisio** | `GET /api/v1/operations/{txn_id}` | `completed`, `confirmed` (and `order_number` matches the invoice) | `expired` → invoice `expired`; `cancelled` → `cancelled` |
+| **Plisio** | — | `mismatch`, `cancelled duplicate` | **not** marked paid (log only, `skipped`) |
 
 Limitation: sync does **not** poll Stripe subscriptions (`StripeSubscription`) — only invoice checkout sessions.
 
@@ -823,7 +828,7 @@ invoice = api.create_invoice(
 attempt = api.create_checkout(invoice)
 # attempt.payment_url — link for user redirect
 
-# Apply promo code to pending invoice
+# Apply promo code to pending invoice (only before create_checkout)
 invoice = api.apply_promo(invoice, "SAVE10")
 
 # Private discount
@@ -873,23 +878,27 @@ Factory: `payments.services.get_payment_service(provider)` / `create_checkout(in
 
 ### Stripe (`StripePaymentService`)
 
-- Creates **Checkout Session** (`stripe.checkout.Session.create`).
+- Creates **Checkout Session** (`stripe.checkout.Session.create`); the secret key is passed per call (global `stripe.api_key` is not modified).
 - Mode `payment` for `one_time`, `subscription` for `month` / `year`.
-- If `Price` has `stripe_price_id`, the existing Stripe price is used.
-- Webhook: `checkout.session.completed` → `mark_invoice_paid`.
+- If `Price` has `stripe_price_id`, the existing Stripe price is used with the invoice quantity. A discounted one-time invoice is charged as a single line with the invoice total; a subscription discount is applied as a one-time Stripe coupon (`duration=once`), so the following periods are billed at the full price.
+- Subscription metadata (`subscription_data.metadata`) carries `invoice_id`, so `customer.subscription.*` events are linked to the invoice.
+- Webhook: `checkout.session.completed` / `async_payment_succeeded` → `mark_invoice_paid`, only if `payment_status` is `paid` (or `no_payment_required`) and `amount_total`/`currency` match the invoice. Otherwise the `payment_mismatch` signal is sent and the invoice stays pending.
+- Subscriptions: `UserEntitlement.active_until` follows `current_period_end` (renewals extend access); `canceled` / `unpaid` / `incomplete_expired` / `paused` revoke access.
 - Cron: `sync_invoice_status()` → `Session.retrieve` → same logic as webhook (`_apply_checkout_session_paid`).
 
 **Webhook setup in Stripe Dashboard:**
 
 - URL: `https://your-domain/billing/webhooks/stripe/`
-- Event: `checkout.session.completed`
+- Events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`
 - Secret → `DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET`
 
 ### Plisio (`PlisioPaymentService`)
 
-- Creates crypto invoice via `GET https://api.plisio.net/api/v1/invoices/new`.
-- Callback verified via `verify_hash` (SHA1 of sorted query + secret).
-- Statuses `completed` / `confirmed` → payment counted.
+- Creates crypto invoice via `GET https://api.plisio.net/api/v1/invoices/new` (`return_existing=true`, `expire_min` from the invoice TTL).
+- `json=true` is appended to `callback_url`: Plisio sends JSON callbacks signed with `HMAC-SHA1(JSON, secret)`. Form-encoded callbacks (without `json=true`) are verified as `HMAC-SHA1(PHP serialize(ksort(data)), secret)` — as in the [Plisio docs](https://plisio.net/documentation/endpoints/create-an-invoice).
+- If a secret is configured, `verify_hash` is mandatory; comparison is constant-time.
+- The API key is never stored in `PaymentAttempt.error_message` or logs (it is passed in the query string, so errors are redacted).
+- Statuses `completed` / `confirmed` → payment counted; `mismatch` and `expired` with a partial amount → `payment_mismatch` signal (manual review); `expired` / `cancelled` → invoice `expired` / `cancelled`.
 - Cron: `GET /operations/{txn_id}`; `mismatch` does not move invoice to `paid`.
 
 **Callback URL in Plisio dashboard:**
@@ -939,6 +948,8 @@ POST /billing/payments/plisio/invoice/
 
 **Body:** `{ "invoice_id": 123 }` — provider must match `invoice.provider`.
 
+**Errors:** `400` — business error (invalid promo code, invoice not payable), `404` — invoice/price not found, `502` — payment provider error.
+
 ### Balance
 
 ```http
@@ -955,6 +966,8 @@ GET /billing/balance/ledger/?currency=USD
 | `POST /billing/webhooks/plisio/` | Plisio | disabled |
 
 **Idempotency:** keys like `stripe:{event_id}` and `plisio:{txn_id}:{status}`. Retry does not cause duplicate balance crediting.
+
+**Responses:** `400` — signature verification failed; `500` — processing error (the provider retries delivery, `WebhookEvent.status=failed` with `error_message` is kept for audit).
 
 **Fallback:** periodic `dsp_sync_invoices` uses the same `mark_invoice_paid` / status updates — repeated sync is safe.
 
@@ -981,9 +994,13 @@ def on_entitlement(sender, entitlement, invoice, **kwargs):
 | Signal | When |
 |--------|-------|
 | `invoice_paid` | Invoice moved to `paid` |
-| `payment_failed` | Checkout creation error |
+| `payment_failed` | Checkout creation error / Stripe async payment failed |
 | `balance_changed` | New entry in `BalanceLedger` |
 | `entitlement_granted` | `UserEntitlement` created |
+| `payment_mismatch` | Payment amount/currency does not match the invoice (`reason`: `amount_mismatch`, `currency_mismatch`, `mismatch`, `expired_partial`) |
+| `subscription_changed` | `StripeSubscription` status or period changed |
+
+Signals are sent **after the transaction commits** (`transaction.on_commit` + `send_robust`): a receiver exception is logged and does not roll back the payment.
 
 ---
 
@@ -991,7 +1008,7 @@ def on_entitlement(sender, entitlement, invoice, **kwargs):
 
 All main models are registered.
 
-- **Invoice** — inline lines and discounts, filters by `provider`, `status`, `currency`.
+- **Invoice** — inline lines and discounts, filters by `provider`, `status`, `currency`. `status` is read-only; use the «Mark as paid» action (goes through `mark_invoice_paid`: ledger + entitlement + signals).
 - **PaymentAttempt** — general list + separate proxy **Stripe** / **Plisio**.
 - **BalanceLedger** — read-only (no edit/delete).
 - **WebhookEvent** — readonly `payload` for audit.
@@ -1024,7 +1041,7 @@ attempt = api.create_checkout(invoice)
 
 ### Stripe subscription
 
-Create a `Price` with `billing_period=month` (or `year`) and on checkout Stripe opens subscription mode. State is stored in `StripeSubscription` (webhook updates can be extended in your project).
+Create a `Price` with `billing_period=month` (or `year`) and on checkout Stripe opens subscription mode. State is stored in `StripeSubscription` and kept up to date by `customer.subscription.*` webhooks; `StripeSubscription.entitlement.active_until` follows the paid period, so `UserEntitlement.is_active` reflects renewals and cancellation. Renewal charges are not written to `BalanceLedger` — listen to `subscription_changed` if you need it.
 
 ### Cron: webhooks + status catch-up
 
@@ -1085,6 +1102,12 @@ pytest tests/ -v
 ruff check src tests
 mypy src/django_stripe_plisio
 python -m build
+```
+
+Tests run on SQLite by default. To run against PostgreSQL (as in CI):
+
+```bash
+DSP_TEST_DB=postgres POSTGRES_HOST=localhost POSTGRES_DB=dsp_test pytest tests/
 ```
 
 ### Repository structure

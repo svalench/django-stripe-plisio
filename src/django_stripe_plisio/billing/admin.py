@@ -1,5 +1,7 @@
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.contrib.auth import get_user_model
 
+from django_stripe_plisio.billing.enums import InvoiceStatus
 from django_stripe_plisio.billing.models import (
     BalanceLedger,
     DiscountGrant,
@@ -11,6 +13,7 @@ from django_stripe_plisio.billing.models import (
     PromoCode,
     UserEntitlement,
 )
+from django_stripe_plisio.billing.services import mark_invoice_paid
 
 
 class InvoiceLineInline(admin.TabularInline):
@@ -73,6 +76,10 @@ class DiscountGrantAdmin(admin.ModelAdmin):
     raw_id_fields = ("user",)
 
 
+def _user_search_field() -> str:
+    return f"user__{get_user_model().USERNAME_FIELD}"
+
+
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
     list_display = (
@@ -86,9 +93,10 @@ class InvoiceAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("provider", "status", "currency")
-    search_fields = ("user__username", "external_id")
     raw_id_fields = ("user",)
+    # Статус меняется только сервисами: ручной paid без ledger/entitlement ломает учёт
     readonly_fields = (
+        "status",
         "subtotal_minor",
         "discount_minor",
         "total_minor",
@@ -97,6 +105,18 @@ class InvoiceAdmin(admin.ModelAdmin):
         "updated_at",
     )
     inlines = [InvoiceLineInline, InvoiceDiscountInline]
+    actions = ["mark_paid"]
+
+    def get_search_fields(self, request):
+        return (_user_search_field(), "external_id")
+
+    @admin.action(description="Отметить оплаченными (ledger + entitlement)")
+    def mark_paid(self, request, queryset):
+        count = 0
+        for invoice in queryset.exclude(status=InvoiceStatus.PAID):
+            mark_invoice_paid(invoice)
+            count += 1
+        self.message_user(request, f"Оплаченными отмечено счетов: {count}", messages.SUCCESS)
 
 
 @admin.register(UserEntitlement)

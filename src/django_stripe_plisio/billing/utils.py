@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 from django_stripe_plisio.conf import PackageSettings
 
 if TYPE_CHECKING:
-    from django.contrib.auth.models import AbstractBaseUser
+    from django_stripe_plisio.types import UserType
 
 
-def user_external_id(user: AbstractBaseUser) -> str:
+def user_external_id(user: UserType) -> str:
     """Идентификатор пользователя для metadata провайдеров."""
     field_name = PackageSettings.user_id_field()
     if field_name == "pk":

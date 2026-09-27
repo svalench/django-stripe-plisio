@@ -1,0 +1,12 @@
+---
+description: Проверка подписи webhooks Stripe/Plisio и тесты на неё
+globs: src/django_stripe_plisio/payments/**/*.py,tests/**/*.py
+alwaysApply: false
+---
+
+# Webhook verification
+
+- Stripe: проверять только подпись через `stripe.WebhookSignature.verify_header(body, sig, secret, tolerance=stripe.Webhook.DEFAULT_TOLERANCE)`, JSON разбирать самим. `construct_event` в stripe>=15 разбирает событие SDK и падает (500) на payload без `"object": "event"`. Без явного `tolerance` `verify_header` не проверяет timestamp (replay).
+- Plisio: HMAC-SHA1 от `json.dumps(..., separators=(",", ":"), ensure_ascii=False)` для `json=true` или от PHP `serialize(ksort)` для form; сравнение `hmac.compare_digest`.
+- Тесты webhooks обязаны включать хотя бы один сценарий с настоящей подписью через HTTP (`Client().post(...)`), а не только `patch.object(..., "verify_webhook")` — подмена скрывает ошибки verify-слоя.
+- Перед релизом — smoke в `demo_project` через `runserver` с реально подписанными событиями.

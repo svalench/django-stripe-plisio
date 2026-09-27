@@ -62,6 +62,8 @@ def test_sync_stripe_paid(stripe_pending_invoice):
         "id": "cs_sync_test",
         "payment_status": "paid",
         "status": "complete",
+        "amount_total": 1000,
+        "currency": "usd",
         "metadata": {"invoice_id": str(stripe_pending_invoice.pk)},
         "client_reference_id": str(stripe_pending_invoice.pk),
     }
@@ -187,6 +189,9 @@ def test_stripe_apply_checkout_session_paid_refactor(stripe_pending_invoice):
         "id": "cs_sync_test",
         "metadata": {"invoice_id": str(stripe_pending_invoice.pk)},
         "client_reference_id": str(stripe_pending_invoice.pk),
+        "payment_status": "paid",
+        "amount_total": 1000,
+        "currency": "usd",
     }
     assert service._apply_checkout_session_paid(obj) is True
     stripe_pending_invoice.refresh_from_db()

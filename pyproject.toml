@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-stripe-plisio"
-version = "0.1.1"
+version = "0.4.0"
 description = "Reusable Django billing package for Stripe and Plisio payments"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "django-stripe-plisio contributors" }]
 dependencies = [
-    "Django>=5.0",
+    "Django>=5.2",
     "requests>=2.31",
     "stripe>=8.0",
 ]
@@ -22,7 +22,9 @@ api = ["djangorestframework>=3.15"]
 dev = [
     "django-stripe-plisio[api]",
     "build>=1.2",
+    "django-stubs>=5.0",
     "mypy>=1.11",
+    "psycopg[binary]>=3.1",
     "types-requests>=2.31",
     "ruff>=0.6",
     "pytest>=8.0",
@@ -59,6 +61,10 @@ python_version = "3.11"
 mypy_path = "src"
 packages = ["django_stripe_plisio"]
 ignore_missing_imports = true
+plugins = ["mypy_django_plugin.main"]
+
+[tool.django-stubs]
+django_settings_module = "tests.settings"
 
 [[tool.mypy.overrides]]
 module = "django_stripe_plisio.*.models"

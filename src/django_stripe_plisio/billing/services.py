@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+import logging
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.utils import timezone
 
 from django_stripe_plisio.billing.enums import (
@@ -26,10 +27,20 @@ from django_stripe_plisio.billing.models import (
     UserEntitlement,
 )
 from django_stripe_plisio.conf import PackageSettings
-from django_stripe_plisio.signals import balance_changed, entitlement_granted, invoice_paid
+from django_stripe_plisio.exceptions import BillingError
+from django_stripe_plisio.signals import (
+    balance_changed,
+    entitlement_granted,
+    invoice_paid,
+    send_on_commit,
+)
 
 if TYPE_CHECKING:
-    from django.contrib.auth.models import AbstractBaseUser
+    from django_stripe_plisio.types import UserType
+
+logger = logging.getLogger(__name__)
+
+PAYABLE_INVOICE_STATUSES = (InvoiceStatus.DRAFT, InvoiceStatus.PENDING)
 
 
 def validate_currency(currency: str) -> str:
@@ -37,15 +48,15 @@ def validate_currency(currency: str) -> str:
     allowed = PackageSettings.allowed_currencies()
     if currency not in allowed:
         msg = f"Currency {currency} not allowed. Allowed: {allowed}"
-        raise ValueError(msg)
+        raise BillingError(msg)
     return currency
 
 
 def validate_price_for_sale(price: Price) -> None:
     if not price.is_active:
-        raise ValueError("Price is not active")
+        raise BillingError("Price is not active")
     if not price.product.is_active:
-        raise ValueError("Product is not active")
+        raise BillingError("Product is not active")
 
 
 def calculate_discount_minor(
@@ -70,6 +81,21 @@ def calculate_discount_minor(
     return 0
 
 
+def _discount_from_source(
+    source: PromoCode | DiscountGrant,
+    subtotal_minor: int,
+    currency: str,
+) -> int:
+    return calculate_discount_minor(
+        subtotal_minor,
+        currency,
+        source.discount_type,
+        source.percent_value,
+        source.fixed_amount_minor,
+        source.fixed_currency,
+    )
+
+
 def _promo_is_valid(promo: PromoCode) -> bool:
     now = timezone.now()
     if not promo.is_active:
@@ -78,9 +104,25 @@ def _promo_is_valid(promo: PromoCode) -> bool:
         return False
     if promo.valid_until and promo.valid_until < now:
         return False
-    if promo.max_uses is not None and promo.used_count >= promo.max_uses:
-        return False
     return True
+
+
+def _promo_reserved_count(promo: PromoCode, exclude_invoice_id: int | None = None) -> int:
+    """Неоплаченные счета с промокодом резервируют использование до оплаты или истечения."""
+    qs = InvoiceDiscount.objects.filter(
+        promo_code=promo,
+        invoice__status__in=PAYABLE_INVOICE_STATUSES,
+    )
+    if exclude_invoice_id is not None:
+        qs = qs.exclude(invoice_id=exclude_invoice_id)
+    return qs.count()
+
+
+def _promo_has_capacity(promo: PromoCode, exclude_invoice_id: int | None = None) -> bool:
+    if promo.max_uses is None:
+        return True
+    reserved = _promo_reserved_count(promo, exclude_invoice_id)
+    return promo.used_count + reserved < promo.max_uses
 
 
 def _grant_is_valid(grant: DiscountGrant) -> bool:
@@ -94,17 +136,29 @@ def _grant_is_valid(grant: DiscountGrant) -> bool:
     return True
 
 
-def resolve_promo_code(code: str) -> PromoCode | None:
-    try:
-        promo = PromoCode.objects.get(code__iexact=code)
-    except PromoCode.DoesNotExist:
+def resolve_promo_code(
+    code: str,
+    *,
+    for_update: bool = False,
+    exclude_invoice_id: int | None = None,
+) -> PromoCode | None:
+    """Найти действующий промокод со свободным лимитом.
+
+    Точное совпадение приоритетнее регистронезависимого. ``for_update`` блокирует строку
+    промокода, чтобы параллельные счета не превысили ``max_uses`` (нужна транзакция).
+    """
+    qs = PromoCode.objects.all()
+    if for_update:
+        qs = qs.select_for_update()
+    promo = qs.filter(code=code).first() or qs.filter(code__iexact=code).order_by("pk").first()
+    if promo is None or not _promo_is_valid(promo):
         return None
-    if not _promo_is_valid(promo):
+    if not _promo_has_capacity(promo, exclude_invoice_id):
         return None
     return promo
 
 
-def resolve_private_grant(user: AbstractBaseUser) -> DiscountGrant | None:
+def resolve_private_grant(user: UserType) -> DiscountGrant | None:
     grants = DiscountGrant.objects.filter(user=user, is_active=True).order_by("-created_at")
     for grant in grants:
         if _grant_is_valid(grant):
@@ -112,7 +166,7 @@ def resolve_private_grant(user: AbstractBaseUser) -> DiscountGrant | None:
     return None
 
 
-def _invoice_expires_at() -> timezone.datetime | None:
+def _invoice_expires_at() -> datetime | None:
     ttl = PackageSettings.invoice_pending_ttl_hours()
     if ttl is None:
         return None
@@ -121,7 +175,7 @@ def _invoice_expires_at() -> timezone.datetime | None:
 
 @transaction.atomic
 def create_invoice(
-    user: AbstractBaseUser,
+    user: UserType,
     price: Price,
     provider: str,
     quantity: int = 1,
@@ -131,9 +185,9 @@ def create_invoice(
 ) -> Invoice:
     """Создание счёта со снимком цены и опциональной скидкой."""
     if quantity < 1:
-        raise ValueError("quantity must be >= 1")
+        raise BillingError("quantity must be >= 1")
     if provider not in PaymentProvider.values:
-        raise ValueError(f"Invalid provider: {provider}")
+        raise BillingError(f"Invalid provider: {provider}")
 
     price = Price.objects.select_related("product").get(pk=price.pk)
     validate_price_for_sale(price)
@@ -141,14 +195,30 @@ def create_invoice(
     currency = validate_currency(price.currency)
     subtotal = price.amount_minor * quantity
 
+    promo_obj: PromoCode | None = None
+    grant_obj: DiscountGrant | None = None
+    discount_minor = 0
+
+    if promo_code:
+        promo_obj = resolve_promo_code(promo_code, for_update=True)
+        if promo_obj is None:
+            raise BillingError(f"Invalid or expired promo code: {promo_code}")
+        discount_minor = _discount_from_source(promo_obj, subtotal, currency)
+        if discount_minor == 0 and subtotal > 0:
+            raise BillingError(f"Promo code {promo_code} is not applicable to this invoice")
+    elif use_private_grant:
+        grant_obj = resolve_private_grant(user)
+        if grant_obj:
+            discount_minor = _discount_from_source(grant_obj, subtotal, currency)
+
     invoice = Invoice.objects.create(
         user=user,
         status=InvoiceStatus.PENDING,
         provider=provider,
         currency=currency,
         subtotal_minor=subtotal,
-        discount_minor=0,
-        total_minor=subtotal,
+        discount_minor=discount_minor,
+        total_minor=max(0, subtotal - discount_minor),
         expires_at=_invoice_expires_at(),
         metadata=metadata or {},
     )
@@ -163,76 +233,38 @@ def create_invoice(
         currency=currency,
     )
 
-    discount_minor = 0
-    promo_obj: PromoCode | None = None
-    grant_obj: DiscountGrant | None = None
-
-    if promo_code:
-        promo_obj = resolve_promo_code(promo_code)
-        if promo_obj is None:
-            raise ValueError(f"Invalid or expired promo code: {promo_code}")
-        discount_minor = calculate_discount_minor(
-            subtotal,
-            currency,
-            promo_obj.discount_type,
-            promo_obj.percent_value,
-            promo_obj.fixed_amount_minor,
-            promo_obj.fixed_currency,
-        )
-    elif use_private_grant:
-        grant_obj = resolve_private_grant(user)
-        if grant_obj:
-            discount_minor = calculate_discount_minor(
-                subtotal,
-                currency,
-                grant_obj.discount_type,
-                grant_obj.percent_value,
-                grant_obj.fixed_amount_minor,
-                grant_obj.fixed_currency,
-            )
-
-    if discount_minor > 0:
-        discount_type = (
-            promo_obj.discount_type
-            if promo_obj
-            else (grant_obj.discount_type if grant_obj else DiscountType.FIXED)
-        )
-        label = promo_obj.code if promo_obj else (grant_obj.note if grant_obj else "")
+    source = promo_obj or grant_obj
+    if discount_minor > 0 and source is not None:
         InvoiceDiscount.objects.create(
             invoice=invoice,
             promo_code=promo_obj,
             discount_grant=grant_obj,
-            discount_type=discount_type,
+            discount_type=source.discount_type,
             amount_minor=discount_minor,
             currency=currency,
-            label=label,
+            label=promo_obj.code if promo_obj else (grant_obj.note if grant_obj else ""),
         )
-
-    total = max(0, subtotal - discount_minor)
-    invoice.discount_minor = discount_minor
-    invoice.total_minor = total
-    invoice.save(update_fields=["discount_minor", "total_minor", "updated_at"])
 
     return invoice
 
 
+@transaction.atomic
 def apply_promo(invoice: Invoice, code: str) -> Invoice:
-    """Применить промокод к существующему неоплаченному счёту."""
-    if invoice.status not in (InvoiceStatus.DRAFT, InvoiceStatus.PENDING):
-        raise ValueError("Cannot apply promo to non-pending invoice")
+    """Применить промокод к существующему неоплаченному счёту (до создания checkout)."""
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+    if invoice.status not in PAYABLE_INVOICE_STATUSES:
+        raise BillingError("Cannot apply promo to non-pending invoice")
+    if invoice.external_id:
+        # Сумма уже передана провайдеру — изменение скидки разойдётся с суммой оплаты
+        raise BillingError("Cannot apply promo after checkout was created")
 
-    promo = resolve_promo_code(code)
+    promo = resolve_promo_code(code, for_update=True, exclude_invoice_id=invoice.pk)
     if promo is None:
-        raise ValueError(f"Invalid or expired promo code: {code}")
+        raise BillingError(f"Invalid or expired promo code: {code}")
 
-    discount_minor = calculate_discount_minor(
-        invoice.subtotal_minor,
-        invoice.currency,
-        promo.discount_type,
-        promo.percent_value,
-        promo.fixed_amount_minor,
-        promo.fixed_currency,
-    )
+    discount_minor = _discount_from_source(promo, invoice.subtotal_minor, invoice.currency)
+    if discount_minor == 0 and invoice.subtotal_minor > 0:
+        raise BillingError(f"Promo code {code} is not applicable to this invoice")
 
     InvoiceDiscount.objects.filter(invoice=invoice).delete()
     InvoiceDiscount.objects.create(
@@ -251,12 +283,12 @@ def apply_promo(invoice: Invoice, code: str) -> Invoice:
 
 
 def grant_private_discount(
-    user: AbstractBaseUser,
+    user: UserType,
     discount_type: str,
     percent_value: int | None = None,
     fixed_amount_minor: int | None = None,
     fixed_currency: str = "",
-    valid_until=None,
+    valid_until: datetime | None = None,
     note: str = "",
     metadata: dict[str, Any] | None = None,
 ) -> DiscountGrant:
@@ -273,7 +305,7 @@ def grant_private_discount(
     )
 
 
-def get_user_balance(user: AbstractBaseUser, currency: str) -> int:
+def get_user_balance(user: UserType, currency: str) -> int:
     """Баланс пользователя в minor units по валюте."""
     currency = currency.upper()
     result = BalanceLedger.objects.filter(user=user, currency=currency).aggregate(
@@ -283,26 +315,36 @@ def get_user_balance(user: AbstractBaseUser, currency: str) -> int:
 
 
 def _increment_promo_usage_for_invoice(invoice: Invoice) -> None:
-    """Увеличить used_count промокода после успешной оплаты."""
-    discount = (
-        InvoiceDiscount.objects.filter(invoice=invoice, promo_code__isnull=False)
-        .select_related("promo_code")
-        .first()
-    )
-    if not discount or not discount.promo_code_id:
+    """Увеличить used_count промокода после успешной оплаты.
+
+    Лимит проверяется при выставлении счёта; здесь деньги уже получены, поэтому
+    превышение только логируется, а не блокирует зачисление.
+    """
+    discount = InvoiceDiscount.objects.filter(invoice=invoice, promo_code__isnull=False).first()
+    if discount is None or discount.promo_code_id is None:
         return
 
-    promo = PromoCode.objects.select_for_update().get(pk=discount.promo_code_id)
-    if promo.max_uses is not None and promo.used_count >= promo.max_uses:
-        raise ValueError(f"Promo code {promo.code} usage limit exceeded")
+    PromoCode.objects.filter(pk=discount.promo_code_id).update(used_count=F("used_count") + 1)
+    promo = PromoCode.objects.get(pk=discount.promo_code_id)
+    if promo.max_uses is not None and promo.used_count > promo.max_uses:
+        logger.warning(
+            "Promo code %s usage exceeded max_uses (%s > %s) by paid invoice %s",
+            promo.code,
+            promo.used_count,
+            promo.max_uses,
+            invoice.pk,
+        )
 
-    promo.used_count += 1
-    promo.save(update_fields=["used_count"])
+
+def _ensure_ledger_owner(entry: BalanceLedger, user: UserType) -> BalanceLedger:
+    if entry.user_id != user.pk:
+        raise BillingError(f"Ledger reference {entry.reference} belongs to another user")
+    return entry
 
 
 @transaction.atomic
 def record_ledger_entry(
-    user: AbstractBaseUser,
+    user: UserType,
     entry_type: str,
     amount_minor: int,
     currency: str,
@@ -311,28 +353,33 @@ def record_ledger_entry(
     note: str = "",
     metadata: dict[str, Any] | None = None,
 ) -> BalanceLedger:
-    """Запись проводки в ledger (append-only)."""
+    """Запись проводки в ledger (append-only, идемпотентно по ``reference``)."""
     currency = validate_currency(currency)
     if reference:
         existing = BalanceLedger.objects.filter(reference=reference).first()
-        if existing:
-            return existing
+        if existing is not None:
+            return _ensure_ledger_owner(existing, user)
 
     try:
-        entry = BalanceLedger.objects.create(
-            user=user,
-            entry_type=entry_type,
-            amount_minor=amount_minor,
-            currency=currency,
-            invoice=invoice,
-            reference=reference,
-            note=note,
-            metadata=metadata or {},
-        )
+        # Savepoint: после IntegrityError внешняя транзакция PostgreSQL остаётся рабочей
+        with transaction.atomic():
+            entry = BalanceLedger.objects.create(
+                user=user,
+                entry_type=entry_type,
+                amount_minor=amount_minor,
+                currency=currency,
+                invoice=invoice,
+                reference=reference,
+                note=note,
+                metadata=metadata or {},
+            )
     except IntegrityError:
-        entry = BalanceLedger.objects.get(reference=reference)
+        if not reference:
+            raise
+        return _ensure_ledger_owner(BalanceLedger.objects.get(reference=reference), user)
 
-    balance_changed.send(
+    send_on_commit(
+        balance_changed,
         sender=BalanceLedger,
         user=user,
         entry=entry,
@@ -342,13 +389,35 @@ def record_ledger_entry(
     return entry
 
 
+def _grant_entitlement(invoice: Invoice) -> None:
+    line = InvoiceLine.objects.filter(invoice=invoice).select_related("price__product").first()
+    if line is None or line.price is None:
+        return
+    entitlement = UserEntitlement.objects.create(
+        user=invoice.user,
+        product=line.price.product,
+        invoice=invoice,
+        source=invoice.provider,
+        metadata={"invoice_id": invoice.pk},
+    )
+    send_on_commit(
+        entitlement_granted,
+        sender=UserEntitlement,
+        entitlement=entitlement,
+        invoice=invoice,
+    )
+
+
 @transaction.atomic
 def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
-    """Отметить счёт оплаченным и начислить баланс/entitlement."""
+    """Отметить счёт оплаченным и начислить баланс/entitlement (идемпотентно)."""
     invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
 
     if invoice.status == InvoiceStatus.PAID:
         return invoice
+    if invoice.status not in PAYABLE_INVOICE_STATUSES:
+        # Оплата пришла после истечения/отмены: деньги получены, счёт всё равно закрываем
+        logger.warning("Invoice %s paid in status %s", invoice.pk, invoice.status)
 
     invoice.status = InvoiceStatus.PAID
     invoice.paid_at = timezone.now()
@@ -368,18 +437,9 @@ def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
         note="Payment received",
     )
 
-    line = InvoiceLine.objects.filter(invoice=invoice).select_related("price__product").first()
-    if line and line.price and line.price.product:
-        entitlement = UserEntitlement.objects.create(
-            user=invoice.user,
-            product=line.price.product,
-            invoice=invoice,
-            source=invoice.provider,
-            metadata={"invoice_id": invoice.pk},
-        )
-        entitlement_granted.send(sender=UserEntitlement, entitlement=entitlement, invoice=invoice)
+    _grant_entitlement(invoice)
 
-    invoice_paid.send(sender=Invoice, invoice=invoice)
+    send_on_commit(invoice_paid, sender=Invoice, invoice=invoice)
     return invoice
 
 

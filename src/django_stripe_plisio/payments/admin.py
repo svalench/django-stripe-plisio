@@ -57,4 +57,5 @@ class ProviderTransactionAdmin(admin.ModelAdmin):
 class StripeSubscriptionAdmin(admin.ModelAdmin):
     list_display = ("user", "stripe_subscription_id", "status", "current_period_end")
     list_filter = ("status",)
-    raw_id_fields = ("user", "price")
+    search_fields = ("stripe_subscription_id", "stripe_customer_id")
+    raw_id_fields = ("user", "price", "entitlement")

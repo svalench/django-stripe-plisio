@@ -1,5 +1,6 @@
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -15,7 +16,14 @@ from django_stripe_plisio.api.serializers import (
 from django_stripe_plisio.billing.enums import PaymentProvider
 from django_stripe_plisio.billing.models import BalanceLedger, Invoice, Price, Product
 from django_stripe_plisio.billing.services import create_invoice
+from django_stripe_plisio.exceptions import BillingError, PaymentProviderError
 from django_stripe_plisio.payments.services import create_checkout
+
+
+class PaymentProviderUnavailable(APIException):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_detail = "Payment provider error"
+    default_code = "payment_provider_error"
 
 
 class ProductListView(generics.ListAPIView):
@@ -42,13 +50,16 @@ class InvoiceListCreateView(generics.ListCreateAPIView):
         ser.is_valid(raise_exception=True)
         price = get_object_or_404(Price, pk=ser.validated_data["price_id"], is_active=True)
         promo = ser.validated_data.get("promo_code") or None
-        invoice = create_invoice(
-            user=request.user,
-            price=price,
-            provider=ser.validated_data["provider"],
-            quantity=ser.validated_data["quantity"],
-            promo_code=promo,
-        )
+        try:
+            invoice = create_invoice(
+                user=request.user,
+                price=price,
+                provider=ser.validated_data["provider"],
+                quantity=ser.validated_data["quantity"],
+                promo_code=promo,
+            )
+        except BillingError as exc:
+            raise ValidationError({"detail": str(exc)}) from exc
         return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
 
 
@@ -60,8 +71,11 @@ class InvoiceDetailView(generics.RetrieveAPIView):
         return Invoice.objects.filter(user=self.request.user).prefetch_related("lines")
 
 
-class StripeCheckoutView(APIView):
+class ProviderCheckoutView(APIView):
+    """Создание оплаты по счёту пользователя у заданного провайдера."""
+
     permission_classes = [permissions.IsAuthenticated]
+    provider: str = ""
 
     def post(self, request):
         ser = CheckoutSerializer(data=request.data)
@@ -70,26 +84,23 @@ class StripeCheckoutView(APIView):
             Invoice,
             pk=ser.validated_data["invoice_id"],
             user=request.user,
-            provider=PaymentProvider.STRIPE,
+            provider=self.provider,
         )
-        attempt = create_checkout(invoice)
+        try:
+            attempt = create_checkout(invoice)
+        except BillingError as exc:
+            raise ValidationError({"detail": str(exc)}) from exc
+        except PaymentProviderError as exc:
+            raise PaymentProviderUnavailable() from exc
         return Response(PaymentAttemptSerializer(attempt).data, status=status.HTTP_201_CREATED)
 
 
-class PlisioInvoiceView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+class StripeCheckoutView(ProviderCheckoutView):
+    provider = PaymentProvider.STRIPE
 
-    def post(self, request):
-        ser = CheckoutSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        invoice = get_object_or_404(
-            Invoice,
-            pk=ser.validated_data["invoice_id"],
-            user=request.user,
-            provider=PaymentProvider.PLISIO,
-        )
-        attempt = create_checkout(invoice)
-        return Response(PaymentAttemptSerializer(attempt).data, status=status.HTTP_201_CREATED)
+
+class PlisioInvoiceView(ProviderCheckoutView):
+    provider = PaymentProvider.PLISIO
 
 
 class BalanceLedgerListView(generics.ListAPIView):

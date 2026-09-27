@@ -21,12 +21,18 @@ class Command(BaseCommand):
             default=None,
             help="Лимит счетов за прогон (по умолчанию из настроек)",
         )
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Запустить даже если sync_invoices выключен в DJANGO_STRIPE_PLISIO_CRON",
+        )
 
     def handle(self, *args, **options):
-        if not PackageSettings.cron_task_enabled("sync_invoices"):
+        if not options["force"] and not PackageSettings.cron_task_enabled("sync_invoices"):
             self.stdout.write(
                 self.style.WARNING(
-                    "sync_invoices is disabled in DJANGO_STRIPE_PLISIO_CRON; skipping",
+                    "sync_invoices is disabled in DJANGO_STRIPE_PLISIO_CRON; skipping "
+                    "(use --force for a manual run)",
                 ),
             )
             return

@@ -21,4 +21,7 @@ class StripeSubscriptionStatus(models.TextChoices):
     PAST_DUE = "past_due", "Past due"
     CANCELED = "canceled", "Canceled"
     INCOMPLETE = "incomplete", "Incomplete"
+    INCOMPLETE_EXPIRED = "incomplete_expired", "Incomplete expired"
     TRIALING = "trialing", "Trialing"
+    UNPAID = "unpaid", "Unpaid"
+    PAUSED = "paused", "Paused"

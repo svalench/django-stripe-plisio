@@ -4,7 +4,7 @@ from django.conf import settings
 from django.db import models
 
 from django_stripe_plisio.billing.enums import PaymentProvider
-from django_stripe_plisio.billing.models import Invoice, Price
+from django_stripe_plisio.billing.models import Invoice, Price, UserEntitlement
 from django_stripe_plisio.payments.enums import (
     PaymentAttemptStatus,
     StripeSubscriptionStatus,
@@ -28,7 +28,7 @@ class PaymentAttempt(models.Model):
         db_index=True,
     )
     external_id = models.CharField(max_length=255, blank=True, db_index=True)
-    payment_url = models.URLField(blank=True)
+    payment_url = models.URLField(max_length=2048, blank=True)
     request_payload = models.JSONField(default=dict, blank=True)
     response_payload = models.JSONField(default=dict, blank=True)
     error_code = models.CharField(max_length=64, blank=True)
@@ -152,6 +152,14 @@ class StripeSubscription(models.Model):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
+    )
+    entitlement = models.ForeignKey(
+        UserEntitlement,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stripe_subscriptions",
+        help_text="Доступ, срок которого продлевается/отзывается по статусу подписки",
     )
     stripe_subscription_id = models.CharField(max_length=255, unique=True)
     stripe_customer_id = models.CharField(max_length=255, blank=True)

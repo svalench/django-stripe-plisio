@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from django_stripe_plisio.billing.enums import PaymentProvider
 from django_stripe_plisio.billing.models import (
     BalanceLedger,
     Invoice,
@@ -66,7 +67,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
 class CreateInvoiceSerializer(serializers.Serializer):
     price_id = serializers.IntegerField()
     quantity = serializers.IntegerField(default=1, min_value=1)
-    provider = serializers.ChoiceField(choices=["stripe", "plisio"])
+    provider = serializers.ChoiceField(choices=PaymentProvider.choices)
     promo_code = serializers.CharField(required=False, allow_blank=True)
 
 
