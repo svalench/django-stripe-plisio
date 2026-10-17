@@ -11,6 +11,7 @@ from django.db.models import F, Sum
 from django.utils import timezone
 
 from django_stripe_plisio.billing.enums import (
+    BillingPeriod,
     DiscountType,
     InvoiceStatus,
     LedgerEntryType,
@@ -73,9 +74,10 @@ def calculate_discount_minor(
             return 0
         return min(subtotal_minor, (subtotal_minor * percent_value) // 100)
     if discount_type == DiscountType.FIXED:
-        if fixed_amount_minor is None:
+        # Пустая валюта больше не означает «любая»: 500 minor в JPY и в USD — разные деньги.
+        if not fixed_amount_minor or fixed_amount_minor <= 0:
             return 0
-        if fixed_currency and fixed_currency.upper() != currency.upper():
+        if not fixed_currency or fixed_currency.upper() != currency.upper():
             return 0
         return min(subtotal_minor, fixed_amount_minor)
     return 0
@@ -191,6 +193,8 @@ def create_invoice(
 
     price = Price.objects.select_related("product").get(pk=price.pk)
     validate_price_for_sale(price)
+    if provider == PaymentProvider.PLISIO and price.billing_period != BillingPeriod.ONE_TIME:
+        raise BillingError("Plisio supports one-time prices only")
 
     currency = validate_currency(price.currency)
     subtotal = price.amount_minor * quantity
@@ -389,6 +393,20 @@ def record_ledger_entry(
     return entry
 
 
+def _provisional_active_until(price: Price) -> datetime | None:
+    """Срок доступа до прихода webhook подписки.
+
+    Разовая цена без даты окончания. Месяц/год — 30/365 дней; Stripe затем
+    перезаписывает ``active_until`` из ``current_period_end``.
+    """
+    now = timezone.now()
+    if price.billing_period == BillingPeriod.MONTH:
+        return now + timedelta(days=30)
+    if price.billing_period == BillingPeriod.YEAR:
+        return now + timedelta(days=365)
+    return None
+
+
 def _grant_entitlement(invoice: Invoice) -> None:
     line = InvoiceLine.objects.filter(invoice=invoice).select_related("price__product").first()
     if line is None or line.price is None:
@@ -398,6 +416,7 @@ def _grant_entitlement(invoice: Invoice) -> None:
         product=line.price.product,
         invoice=invoice,
         source=invoice.provider,
+        active_until=_provisional_active_until(line.price),
         metadata={"invoice_id": invoice.pk},
     )
     send_on_commit(
@@ -444,11 +463,16 @@ def mark_invoice_paid(invoice: Invoice, external_id: str = "") -> Invoice:
 
 
 def expire_pending_invoices() -> int:
-    """Перевести просроченные pending-счета в expired."""
+    """Перевести просроченные pending-счета без сессии провайдера в expired.
+
+    Непустой ``external_id`` не трогаем: оплату мог подтвердить провайдер уже после TTL,
+    и это должен увидеть ``sync_pending_invoices``, а не локальный expire.
+    """
     now = timezone.now()
     qs = Invoice.objects.filter(
         status=InvoiceStatus.PENDING,
         expires_at__isnull=False,
         expires_at__lt=now,
+        external_id="",
     )
     return qs.update(status=InvoiceStatus.EXPIRED, updated_at=now)

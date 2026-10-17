@@ -27,9 +27,8 @@ def _pending_invoices_queryset():
 def sync_pending_invoices(*, batch_size: int | None = None, dry_run: bool = False) -> SyncResult:
     """Опросить провайдеров по pending-счетам с external_id.
 
-    Каждый счёт — в своей транзакции: HTTP-запросы не держат блокировки всей пачки,
-    а ошибка БД на одном счёте не ломает остальные. Изменения статусов идемпотентны
-    и защищены блокировкой счёта внутри сервисов.
+    HTTP к провайдеру выполняется вне транзакции. Запись статуса — короткими
+    транзакциями внутри сервиса. Ошибка одного счёта не ломает остальные.
     """
     from django_stripe_plisio.payments.services import get_payment_service
 
@@ -49,9 +48,14 @@ def sync_pending_invoices(*, batch_size: int | None = None, dry_run: bool = Fals
             continue
 
         try:
-            with transaction.atomic():
-                service = get_payment_service(invoice.provider)
-                outcome = service.sync_invoice_status(invoice)
+            service = get_payment_service(invoice.provider)
+            remote = service.load_remote_invoice_state(invoice)
+            if isinstance(remote, InvoiceSyncOutcome):
+                outcome = remote
+            else:
+                with transaction.atomic():
+                    current = Invoice.objects.select_for_update().get(pk=invoice.pk)
+                    outcome = service.apply_remote_invoice_state(current, remote)
         except Exception:
             logger.exception("Invoice sync failed for invoice %s", invoice.pk)
             result.errors += 1

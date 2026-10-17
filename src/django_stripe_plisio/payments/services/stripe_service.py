@@ -8,14 +8,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import stripe
+from django.core.exceptions import ImproperlyConfigured
+from django.db import transaction
 from django.utils import timezone
 
-from django_stripe_plisio.billing.enums import BillingPeriod, InvoiceStatus, PaymentProvider
+from django_stripe_plisio.billing.enums import (
+    BillingPeriod,
+    InvoiceStatus,
+    LedgerEntryType,
+    PaymentProvider,
+)
 from django_stripe_plisio.billing.models import Invoice, InvoiceLine, UserEntitlement
-from django_stripe_plisio.billing.services import mark_invoice_paid
+from django_stripe_plisio.billing.money import (
+    from_stripe_amount,
+    stripe_amount_is_representable,
+    to_stripe_amount,
+)
+from django_stripe_plisio.billing.services import mark_invoice_paid, record_ledger_entry
 from django_stripe_plisio.billing.utils import user_external_id
 from django_stripe_plisio.conf import PackageSettings
-from django_stripe_plisio.exceptions import WebhookVerificationError
+from django_stripe_plisio.exceptions import BillingError, WebhookVerificationError
 from django_stripe_plisio.payments.enums import (
     PaymentAttemptStatus,
     StripeSubscriptionStatus,
@@ -90,70 +102,174 @@ class StripePaymentService(BasePaymentProvider):
         return "payment"
 
     def create_checkout(self, invoice: Invoice) -> PaymentAttempt:
-        reused = self._reuse_open_session(invoice)
-        if reused is not None:
-            return reused
+        # Импорт ленивый: payments.services импортирует этот модуль
+        from django_stripe_plisio.payments.services import validate_invoice_for_checkout
 
-        attempt = PaymentAttempt.objects.create(
-            invoice=invoice,
-            provider=self.provider,
-            status=PaymentAttemptStatus.CREATED,
-        )
+        self._require_redirect_urls()
 
+        with transaction.atomic():
+            locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
+            validate_invoice_for_checkout(locked)
+            previous = self._latest_attempt(locked, statuses=[PaymentAttemptStatus.PENDING])
+            previous_pk: int | None = None
+            previous_external_id = ""
+            if previous is not None and previous.external_id:
+                previous_pk = previous.pk
+                previous_external_id = previous.external_id
+
+        # HTTP вне блокировки строки счёта
+        if previous_external_id and previous_pk is not None:
+            reused = self._resolve_previous_session(previous_pk, previous_external_id)
+            if reused is not None:
+                return reused
+
+        invoice.refresh_from_db()
         try:
             session_params = self._session_params(invoice)
-            attempt.request_payload = session_params
             session = stripe.checkout.Session.create(api_key=self._api_key, **session_params)
+        except (BillingError, ImproperlyConfigured):
+            raise
         except stripe.StripeError as exc:
-            attempt.status = PaymentAttemptStatus.FAILED
-            attempt.error_code = type(exc).__name__
-            attempt.error_message = str(exc)
-            attempt.save()
+            return self._persist_failed_attempt(
+                invoice,
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+        with transaction.atomic():
+            locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
+            try:
+                validate_invoice_for_checkout(locked)
+            except BillingError:
+                return PaymentAttempt.objects.create(
+                    invoice=locked,
+                    provider=self.provider,
+                    status=PaymentAttemptStatus.FAILED,
+                    error_code="InvoiceNotPayable",
+                    error_message=(
+                        f"Invoice {locked.pk} is not payable after Stripe session {session.id}"
+                    ),
+                    response_payload={"id": session.id, "url": session.url},
+                )
+            winner = self._latest_attempt(locked, statuses=[PaymentAttemptStatus.PENDING])
+            if winner is not None and winner.external_id and winner.pk != previous_pk:
+                logger.warning(
+                    "Stripe session %s left unused; invoice %s already has attempt %s",
+                    session.id,
+                    locked.pk,
+                    winner.pk,
+                )
+                return winner
+            attempt = PaymentAttempt.objects.create(
+                invoice=locked,
+                provider=self.provider,
+                status=PaymentAttemptStatus.PENDING,
+                external_id=session.id,
+                payment_url=session.url or "",
+                request_payload=session_params,
+                response_payload={"id": session.id, "url": session.url},
+            )
+            locked.payment_url = attempt.payment_url
+            locked.external_id = session.id
+            locked.save(update_fields=["payment_url", "external_id", "updated_at"])
             return attempt
 
-        attempt.status = PaymentAttemptStatus.PENDING
-        attempt.external_id = session.id
-        attempt.payment_url = session.url or ""
-        attempt.response_payload = {"id": session.id, "url": session.url}
-        attempt.save()
-
-        invoice.payment_url = attempt.payment_url
-        invoice.external_id = session.id
-        invoice.save(update_fields=["payment_url", "external_id", "updated_at"])
-
-        return attempt
-
-    def _reuse_open_session(self, invoice: Invoice) -> PaymentAttempt | None:
-        """Одна открытая сессия на счёт: иначе клиент может оплатить обе."""
-        previous = self._latest_attempt(invoice, statuses=[PaymentAttemptStatus.PENDING])
-        if previous is None or not previous.external_id:
-            return None
-
+    def _resolve_previous_session(self, attempt_pk: int, external_id: str) -> PaymentAttempt | None:
+        """Открытую сессию возвращаем; завершённую проводим; истёкшую отпускаем под новую."""
         try:
-            session = stripe.checkout.Session.retrieve(previous.external_id, api_key=self._api_key)
+            session = stripe.checkout.Session.retrieve(external_id, api_key=self._api_key)
         except stripe.StripeError:
-            # Статус старой сессии неизвестен — новую не создаём, чтобы не допустить двойной оплаты
-            logger.warning("Stripe session %s retrieve failed, reuse it", previous.external_id)
-            return previous
+            logger.warning("Stripe session %s retrieve failed, reuse it", external_id)
+            return PaymentAttempt.objects.get(pk=attempt_pk)
 
         obj = _as_dict(session)
         status = obj.get("status")
         if status == "open":
-            return previous
+            return PaymentAttempt.objects.get(pk=attempt_pk)
         if status == "complete":
             self._apply_checkout_session_paid(obj)
-            previous.refresh_from_db()
-            return previous
+            return PaymentAttempt.objects.get(pk=attempt_pk)
 
-        previous.status = PaymentAttemptStatus.CANCELLED
-        previous.save(update_fields=["status", "updated_at"])
+        with transaction.atomic():
+            PaymentAttempt.objects.filter(
+                pk=attempt_pk,
+                status=PaymentAttemptStatus.PENDING,
+            ).update(status=PaymentAttemptStatus.CANCELLED, updated_at=timezone.now())
         return None
+
+    def _persist_failed_attempt(
+        self,
+        invoice: Invoice,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> PaymentAttempt:
+        with transaction.atomic():
+            locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
+            return PaymentAttempt.objects.create(
+                invoice=locked,
+                provider=self.provider,
+                status=PaymentAttemptStatus.FAILED,
+                error_code=error_code,
+                error_message=error_message,
+            )
+
+    def _require_redirect_urls(self) -> tuple[str, str]:
+        success_url = PackageSettings.success_url()
+        cancel_url = PackageSettings.cancel_url()
+        if not success_url or not cancel_url:
+            raise ImproperlyConfigured(
+                "DJANGO_STRIPE_PLISIO_SUCCESS_URL and "
+                "DJANGO_STRIPE_PLISIO_CANCEL_URL are required",
+            )
+        return success_url, cancel_url
+
+    def _assert_chargeable_amount(self, invoice: Invoice, line: InvoiceLine | None) -> None:
+        amounts = [invoice.total_minor]
+        if line is not None:
+            amounts.append(line.unit_amount_minor)
+        if invoice.discount_minor:
+            amounts.append(invoice.discount_minor)
+        for amount in amounts:
+            if not stripe_amount_is_representable(amount, invoice.currency):
+                raise BillingError(
+                    f"Amount {amount} {invoice.currency} is not representable as a Stripe amount",
+                )
+
+    def _uses_remote_stripe_price(
+        self,
+        invoice: Invoice,
+        line: InvoiceLine | None,
+        mode: str,
+    ) -> bool:
+        if line is None or line.price is None or not line.price.stripe_price_id:
+            return False
+        if mode == "subscription":
+            return True
+        return invoice.discount_minor == 0
+
+    def _assert_stripe_price(self, invoice: Invoice, line: InvoiceLine | None, mode: str) -> None:
+        """Локальная цена и Stripe Price должны совпасть до создания сессии."""
+        if not self._uses_remote_stripe_price(invoice, line, mode):
+            return
+        assert line is not None and line.price is not None
+        remote = stripe.Price.retrieve(line.price.stripe_price_id, api_key=self._api_key)
+        obj = _as_dict(remote)
+        currency = str(obj.get("currency") or "").upper()
+        unit_amount = obj.get("unit_amount")
+        expected = to_stripe_amount(line.unit_amount_minor, invoice.currency)
+        if currency != invoice.currency or unit_amount is None or int(unit_amount) != expected:
+            raise BillingError(
+                f"Stripe price {line.price.stripe_price_id} amount/currency "
+                f"does not match invoice {invoice.pk}",
+            )
 
     def _session_params(self, invoice: Invoice) -> dict[str, Any]:
         line = self._first_line(invoice)
         mode = self._checkout_mode(line)
-        success_url = PackageSettings.success_url() or "https://example.com/success"
-        cancel_url = PackageSettings.cancel_url() or "https://example.com/cancel"
+        success_url, cancel_url = self._require_redirect_urls()
+        self._assert_chargeable_amount(invoice, line)
+        self._assert_stripe_price(invoice, line, mode)
         metadata = self._stripe_metadata(invoice)
 
         params: dict[str, Any] = {
@@ -195,7 +311,7 @@ class StripePaymentService(BasePaymentProvider):
                 {
                     "price_data": {
                         "currency": invoice.currency.lower(),
-                        "unit_amount": line.unit_amount_minor,
+                        "unit_amount": to_stripe_amount(line.unit_amount_minor, invoice.currency),
                         "product_data": {"name": line.description},
                         "recurring": {"interval": interval},
                     },
@@ -214,7 +330,7 @@ class StripePaymentService(BasePaymentProvider):
             {
                 "price_data": {
                     "currency": invoice.currency.lower(),
-                    "unit_amount": invoice.total_minor,
+                    "unit_amount": to_stripe_amount(invoice.total_minor, invoice.currency),
                     "product_data": {"name": name},
                 },
                 "quantity": 1,
@@ -224,7 +340,7 @@ class StripePaymentService(BasePaymentProvider):
     def _create_once_coupon(self, invoice: Invoice) -> str:
         coupon = stripe.Coupon.create(
             api_key=self._api_key,
-            amount_off=invoice.discount_minor,
+            amount_off=to_stripe_amount(invoice.discount_minor, invoice.currency),
             currency=invoice.currency.lower(),
             duration="once",
             max_redemptions=1,
@@ -285,9 +401,38 @@ class StripePaymentService(BasePaymentProvider):
             self._handle_subscription_upsert(obj)
         elif event_type == "customer.subscription.deleted":
             self._handle_subscription_deleted(obj)
+        elif event_type == "charge.refunded":
+            self._handle_charge_refunded(obj)
+        elif event_type == "refund.updated":
+            self._handle_refund_updated(obj)
         else:
             return WebhookProcessingStatus.SKIPPED
         return WebhookProcessingStatus.PROCESSED
+
+    def _webhook_subject(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[Invoice | None, PaymentAttempt | None]:
+        event_type = str(payload.get("type") or "")
+        obj = (payload.get("data") or {}).get("object") or {}
+        if not isinstance(obj, dict):
+            return None, None
+        if event_type.startswith("checkout.session"):
+            invoice = self._invoice_from_session(obj)
+            attempt = None
+            session_id = obj.get("id")
+            if invoice is not None and session_id:
+                attempt = PaymentAttempt.objects.filter(
+                    invoice=invoice,
+                    provider=self.provider,
+                    external_id=session_id,
+                ).first()
+            return invoice, attempt
+        if event_type.startswith("customer.subscription"):
+            return self._invoice_from_session({"metadata": obj.get("metadata") or {}}), None
+        if event_type in {"charge.refunded", "refund.updated"}:
+            return self._invoice_from_charge_like(obj), None
+        return None, None
 
     def _invoice_from_session(self, obj: dict[str, Any]) -> Invoice | None:
         invoice_id = (obj.get("metadata") or {}).get("invoice_id") or obj.get("client_reference_id")
@@ -309,19 +454,24 @@ class StripePaymentService(BasePaymentProvider):
 
         amount_total = obj.get("amount_total")
         currency = str(obj.get("currency") or "").upper()
-        if (
-            amount_total is None
-            or currency != invoice.currency
-            or int(amount_total) < invoice.total_minor
-        ):
+        expected = to_stripe_amount(invoice.total_minor, invoice.currency)
+        parsed_amount = None if amount_total is None else int(amount_total)
+        if not currency or currency != invoice.currency:
+            reason = "currency_mismatch"
+        elif parsed_amount is None or parsed_amount != expected:
+            reason = "amount_mismatch"
+        else:
+            reason = ""
+        if reason:
             logger.error(
-                "Stripe session %s amount %s %s does not match invoice %s (%s %s)",
+                "Stripe session %s amount %s %s does not match invoice %s (%s %s, stripe %s)",
                 session_id,
                 amount_total,
                 currency,
                 invoice.pk,
                 invoice.total_minor,
                 invoice.currency,
+                expected,
             )
             send_on_commit(
                 payment_mismatch,
@@ -329,7 +479,7 @@ class StripePaymentService(BasePaymentProvider):
                 invoice=invoice,
                 provider=self.provider,
                 payload=obj,
-                reason="amount_mismatch",
+                reason=reason,
             )
             return False
 
@@ -350,7 +500,7 @@ class StripePaymentService(BasePaymentProvider):
             defaults={
                 "invoice": invoice,
                 "payment_attempt": attempt,
-                "amount_minor": int(amount_total),
+                "amount_minor": from_stripe_amount(parsed_amount or 0, currency),
                 "currency": currency,
                 "status": "completed",
                 "raw_payload": obj,
@@ -367,6 +517,84 @@ class StripePaymentService(BasePaymentProvider):
                 stripe_customer_id=obj.get("customer") or "",
             )
         return True
+
+    def _invoice_from_charge_like(self, obj: dict[str, Any]) -> Invoice | None:
+        metadata = obj.get("metadata") or {}
+        invoice_id = metadata.get("invoice_id")
+        if not invoice_id:
+            return None
+        return self._find_invoice(invoice_id)
+
+    def _revoke_invoice_access(self, invoice: Invoice) -> None:
+        now = timezone.now()
+        for entitlement in UserEntitlement.objects.filter(invoice=invoice):
+            if entitlement.active_until is None or entitlement.active_until > now:
+                entitlement.active_until = now
+                entitlement.save(update_fields=["active_until"])
+
+    def _record_stripe_refund(
+        self,
+        invoice: Invoice,
+        refund_id: str,
+        amount: int,
+        currency: str,
+    ) -> None:
+        if currency != invoice.currency:
+            logger.error(
+                "Stripe refund %s currency %s does not match invoice %s (%s)",
+                refund_id,
+                currency,
+                invoice.pk,
+                invoice.currency,
+            )
+            return
+        package_amount = from_stripe_amount(amount, currency)
+        if package_amount <= 0:
+            return
+        record_ledger_entry(
+            user=invoice.user,
+            entry_type=LedgerEntryType.REFUND,
+            amount_minor=-package_amount,
+            currency=invoice.currency,
+            invoice=invoice,
+            reference=f"stripe-refund:{refund_id}",
+            note="Stripe refund",
+        )
+
+    def _handle_charge_refunded(self, charge: dict[str, Any]) -> None:
+        invoice = self._invoice_from_charge_like(charge)
+        if invoice is None:
+            logger.info("Stripe charge %s refund is not linked to an invoice", charge.get("id"))
+            return
+        currency = str(charge.get("currency") or "").upper()
+        refunds = (charge.get("refunds") or {}).get("data") or []
+        for refund in refunds:
+            status = refund.get("status") or "succeeded"
+            if status not in {"succeeded", "pending"}:
+                continue
+            refund_id = str(refund.get("id") or "")
+            amount = refund.get("amount")
+            if not refund_id or amount is None:
+                continue
+            self._record_stripe_refund(invoice, refund_id, int(amount), currency)
+        charged = int(charge.get("amount") or 0)
+        refunded = int(charge.get("amount_refunded") or 0)
+        if charged and refunded >= charged:
+            self._revoke_invoice_access(invoice)
+
+    def _handle_refund_updated(self, refund: dict[str, Any]) -> None:
+        if refund.get("status") != "succeeded":
+            return
+        invoice = self._invoice_from_charge_like(refund)
+        if invoice is None:
+            logger.info("Stripe refund %s is not linked to an invoice", refund.get("id"))
+            return
+        refund_id = str(refund.get("id") or "")
+        amount = refund.get("amount")
+        currency = str(refund.get("currency") or "").upper()
+        if not refund_id or amount is None:
+            return
+        self._record_stripe_refund(invoice, refund_id, int(amount), currency)
 
     def _handle_async_payment_failed(self, obj: dict[str, Any]) -> None:
         invoice = self._invoice_from_session(obj)
@@ -408,22 +636,22 @@ class StripePaymentService(BasePaymentProvider):
             updated_at=timezone.now(),
         )
 
-    def sync_invoice_status(self, invoice: Invoice) -> InvoiceSyncOutcome:
-        """Опрос Stripe Checkout Session по external_id счёта."""
-        if invoice.status != InvoiceStatus.PENDING:
+    def load_remote_invoice_state(self, invoice: Invoice) -> Any:
+        if invoice.status != InvoiceStatus.PENDING or not invoice.external_id:
             return InvoiceSyncOutcome.UNCHANGED
-
-        session_id = invoice.external_id
-        if not session_id:
-            return InvoiceSyncOutcome.UNCHANGED
-
         try:
-            session = stripe.checkout.Session.retrieve(session_id, api_key=self._api_key)
+            session = stripe.checkout.Session.retrieve(invoice.external_id, api_key=self._api_key)
         except stripe.StripeError as exc:
             logger.error("Stripe session retrieve failed for invoice %s: %s", invoice.pk, exc)
             return InvoiceSyncOutcome.ERROR
+        return _as_dict(session)
 
-        obj = _as_dict(session)
+    def apply_remote_invoice_state(self, invoice: Invoice, remote: Any) -> InvoiceSyncOutcome:
+        if isinstance(remote, InvoiceSyncOutcome):
+            return remote
+        if invoice.status != InvoiceStatus.PENDING:
+            return InvoiceSyncOutcome.UNCHANGED
+        obj = remote
         status = obj.get("status", "")
 
         if status == "complete" and obj.get("payment_status") in PAID_SESSION_STATUSES:

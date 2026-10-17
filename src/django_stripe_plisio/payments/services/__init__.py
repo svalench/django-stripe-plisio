@@ -60,18 +60,20 @@ def create_checkout(invoice: Invoice) -> PaymentAttempt:
         raise BillingError(f"Invalid invoice provider: {invoice.provider}")
     service = get_payment_service(invoice.provider)
 
-    with transaction.atomic():
-        # Блокировка счёта: параллельные запросы не создадут две оплачиваемые сессии
-        locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
-        validate_invoice_for_checkout(locked)
-        if _requires_provider_checkout(locked):
-            attempt = service.create_checkout(locked)
-        else:
-            attempt = _complete_free_invoice(locked)
+    # Провайдер сам берёт короткую блокировку вокруг записей в БД и отпускает её на время HTTP.
+    # Нулевой счёт закрываем здесь, без запроса к провайдеру.
+    if not _requires_provider_checkout(invoice):
+        with transaction.atomic():
+            locked = Invoice.objects.select_for_update().get(pk=invoice.pk)
+            validate_invoice_for_checkout(locked)
+            if not _requires_provider_checkout(locked):
+                attempt = _complete_free_invoice(locked)
+                invoice.refresh_from_db()
+                return attempt
+    attempt = service.create_checkout(invoice)
 
-    # Сервис менял заблокированную копию; объект вызывающего кода должен видеть payment_url
     invoice.refresh_from_db()
     if attempt.status == PaymentAttemptStatus.FAILED:
-        send_on_commit(payment_failed, sender=PaymentAttempt, attempt=attempt, invoice=locked)
+        send_on_commit(payment_failed, sender=PaymentAttempt, attempt=attempt, invoice=invoice)
         raise PaymentProviderError(attempt.error_message or "Payment provider error", attempt)
     return attempt

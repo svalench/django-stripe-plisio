@@ -8,6 +8,8 @@ def dsp_package_settings(settings):
     settings.DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET = "whsec_test_secret"
     settings.DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET = "plisio_test_secret"
     settings.DJANGO_STRIPE_PLISIO_REQUIRE_WEBHOOK_SECRET = True
+    settings.DJANGO_STRIPE_PLISIO_SUCCESS_URL = "https://merchant.test/success"
+    settings.DJANGO_STRIPE_PLISIO_CANCEL_URL = "https://merchant.test/cancel"
 
 
 @pytest.fixture
