@@ -101,6 +101,8 @@ def test_sync_plisio_completed(plisio_pending_invoice):
             "status": "completed",
             "order_number": str(plisio_pending_invoice.pk),
             "txn_id": "txn_sync_test",
+            "source_currency": "USD",
+            "source_amount": "10.00",
         },
     }
 

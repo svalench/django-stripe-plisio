@@ -60,11 +60,18 @@ def test_json_signature_base_keeps_order_and_is_compact():
 
 @pytest.mark.django_db
 def test_json_callback_valid_signature_marks_paid(plisio_invoice):
+    PaymentAttempt.objects.create(
+        invoice=plisio_invoice,
+        provider=PaymentProvider.PLISIO,
+        status=PaymentAttemptStatus.PENDING,
+        external_id="txn_json",
+    )
     data = {
         "txn_id": "txn_json",
         "status": "completed",
         "order_number": str(plisio_invoice.pk),
         "source_currency": "USD",
+        "source_amount": "10.00",
     }
     data["verify_hash"] = _sign(json_signature_base(data))
 
@@ -77,11 +84,20 @@ def test_json_callback_valid_signature_marks_paid(plisio_invoice):
     assert response.status_code == 200
     plisio_invoice.refresh_from_db()
     assert plisio_invoice.status == InvoiceStatus.PAID
+    webhook = WebhookEvent.objects.get(idempotency_key="plisio:txn_json:completed")
+    assert webhook.invoice_id == plisio_invoice.pk
+    assert webhook.payment_attempt_id is not None
 
 
 @pytest.mark.django_db
 def test_form_callback_valid_signature_marks_paid(plisio_invoice):
-    data = {"txn_id": "txn_form", "status": "completed", "order_number": str(plisio_invoice.pk)}
+    data = {
+        "txn_id": "txn_form",
+        "status": "completed",
+        "order_number": str(plisio_invoice.pk),
+        "source_currency": "USD",
+        "source_amount": "10.00",
+    }
     data["verify_hash"] = _sign(php_signature_base(data))
 
     response = Client().post("/billing/webhooks/plisio/", data=data)
@@ -219,7 +235,13 @@ def test_sync_rejects_foreign_order_number(plisio_invoice):
 @pytest.mark.django_db
 def test_webhook_failure_is_persisted(plisio_invoice):
     service = PlisioPaymentService()
-    event = {"txn_id": "txn_fail", "status": "completed", "order_number": str(plisio_invoice.pk)}
+    event = {
+        "txn_id": "txn_fail",
+        "status": "completed",
+        "order_number": str(plisio_invoice.pk),
+        "source_currency": "USD",
+        "source_amount": "10.00",
+    }
 
     with patch(
         "django_stripe_plisio.payments.services.plisio_service.mark_invoice_paid",

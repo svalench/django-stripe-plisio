@@ -407,8 +407,7 @@ src/django_stripe_plisio/
     ├── views.py
     └── urls.py
 
-demo_project/            # integration example and pytest environment
-tests/                   # package tests
+tests/                   # package tests and pytest Django settings
 ```
 
 ### Key module responsibilities
@@ -518,8 +517,8 @@ All constants are read with the `DJANGO_STRIPE_PLISIO_` prefix (see `conf.py` �
 | `DJANGO_STRIPE_PLISIO_PLISIO_CALLBACK_SECRET` | for Plisio | Secret for `verify_hash` check in callback |
 | `DJANGO_STRIPE_PLISIO_DEFAULT_CURRENCY` | recommended | Default currency, e.g. `"USD"` |
 | `DJANGO_STRIPE_PLISIO_ALLOWED_CURRENCIES` | recommended | List of allowed currencies, e.g. `["USD", "EUR", "RUB"]` |
-| `DJANGO_STRIPE_PLISIO_SUCCESS_URL` | for checkout | URL after successful payment |
-| `DJANGO_STRIPE_PLISIO_CANCEL_URL` | for checkout | URL on cancellation |
+| `DJANGO_STRIPE_PLISIO_SUCCESS_URL` | required for Stripe checkout | URL after successful payment. Empty value is not replaced with a placeholder |
+| `DJANGO_STRIPE_PLISIO_CANCEL_URL` | required for Stripe checkout | URL on cancellation. Empty value is not replaced with a placeholder |
 | `DJANGO_STRIPE_PLISIO_USER_ID_FIELD` | optional | User field for metadata (default `"pk"`) |
 | `DJANGO_STRIPE_PLISIO_INVOICE_PENDING_TTL_HOURS` | optional | Pending invoice TTL → `expires_at` |
 | `DJANGO_STRIPE_PLISIO_CRON` | for cron | Schedule for `sync_invoices` / `expire_invoices` tasks |
@@ -562,7 +561,7 @@ flowchart TD
 | Command | Purpose |
 |---------|------------|
 | `python manage.py dsp_sync_invoices` | API polling: pending invoices with non-empty `external_id` |
-| `python manage.py dsp_expire_invoices` | Without API: `pending` + `expires_at < now` → `expired` |
+| `python manage.py dsp_expire_invoices` | Without API: `pending` + empty `external_id` + `expires_at < now` → `expired` |
 
 **Order is mandatory:** **sync** first, then **expire**. Otherwise an invoice paid with a delay may become `expired` by TTL before sync sees the payment at the provider.
 
@@ -583,6 +582,7 @@ Sync done: checked=12 paid=2 expired=1 cancelled=0 skipped=0 errors=0
 
 - Does not contact Stripe/Plisio.
 - Requires `INVOICE_PENDING_TTL_HOURS` when creating an invoice (the `expires_at` field).
+- Skips invoices that already have `external_id`. A checkout that outlived the local TTL stays `pending` until sync reads a terminal unpaid status from the provider.
 
 ### What sync does per provider
 
@@ -590,9 +590,9 @@ Only invoices with `status=pending` and non-empty `external_id` are processed. I
 
 | Provider | API | «Paid» condition | Terminal without payment |
 |-----------|-----|--------------------|---------------------|
-| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid` and `status=complete`, `amount_total`/`currency` match the invoice | session `expired` → attempt `cancelled`, invoice stays `pending` and can be paid with a new checkout |
-| **Plisio** | `GET /api/v1/operations/{txn_id}` | `completed`, `confirmed` (and `order_number` matches the invoice) | `expired` → invoice `expired`; `cancelled` → `cancelled` |
-| **Plisio** | — | `mismatch`, `cancelled duplicate` | **not** marked paid (log only, `skipped`) |
+| **Stripe** | `checkout.Session.retrieve(external_id)` | `payment_status=paid`, `status=complete`, and `amount_total`/`currency` **equal** the invoice (overpayment is `payment_mismatch`) | session `expired` → attempt `cancelled`, invoice stays `pending` and can be paid with a new checkout |
+| **Plisio** | `GET /api/v1/operations/{txn_id}` | `completed`, `source_amount`/`source_currency` equal the invoice, `order_number` matches | `expired` with zero amount → invoice `expired`; `cancelled` → `cancelled`; `error` → `failed` |
+| **Plisio** | — | `mismatch`, `expired` with a positive amount, `cancelled duplicate`, `pending internal` | not marked paid. `mismatch` / partial `expired` send `payment_mismatch` and stay `pending` |
 
 Limitation: sync does **not** poll Stripe subscriptions (`StripeSubscription`) — only invoice checkout sessions.
 
@@ -757,7 +757,7 @@ Invoice line — **snapshot** of the price at issue time (changing `Price` does 
 
 #### `PromoCode`
 
-Public promo code: percent or fixed discount, usage limits, validity period.
+Public promo code: percent or fixed discount, usage limits, validity period. A fixed discount applies only when `fixed_currency` equals the invoice currency. An empty currency is not treated as “any currency”.
 
 #### `DiscountGrant`
 
@@ -864,7 +864,7 @@ api.mark_invoice_paid(invoice, external_id="cs_...")
 | `get_user_balance` | `Sum(amount_minor)` over ledger |
 | `record_ledger_entry` | New ledger entry + `balance_changed` signal |
 | `mark_invoice_paid` | Status `paid`, credit in ledger, entitlement, `invoice_paid` |
-| `expire_pending_invoices` | `pending` + expired `expires_at` → `expired` |
+| `expire_pending_invoices` | `pending` + empty `external_id` + expired `expires_at` → `expired` |
 
 Provider sync: `payments.services.invoice_sync.sync_pending_invoices()`.
 
@@ -880,16 +880,19 @@ Factory: `payments.services.get_payment_service(provider)` / `create_checkout(in
 
 - Creates **Checkout Session** (`stripe.checkout.Session.create`); the secret key is passed per call (global `stripe.api_key` is not modified).
 - Mode `payment` for `one_time`, `subscription` for `month` / `year`.
-- If `Price` has `stripe_price_id`, the existing Stripe price is used with the invoice quantity. A discounted one-time invoice is charged as a single line with the invoice total; a subscription discount is applied as a one-time Stripe coupon (`duration=once`), so the following periods are billed at the full price.
+- If `Price` has `stripe_price_id`, the existing Stripe price is used with the invoice quantity, but only after `Price.retrieve` confirms the same `unit_amount` and `currency`. A mismatch raises `BillingError` and does not open a session. A discounted one-time invoice is charged as a single line with the invoice total; a subscription discount is applied as a one-time Stripe coupon (`duration=once`), so the following periods are billed at the full price.
+- Amounts are converted to Stripe units. `UGX` is stored in the package as a zero-decimal currency and sent to Stripe multiplied by 100. Three-decimal currencies (KWD, BHD, …) are rejected unless the minor amount is divisible by 10.
+- `SUCCESS_URL` and `CANCEL_URL` are required. Checkout raises `ImproperlyConfigured` when either is empty.
 - Subscription metadata (`subscription_data.metadata`) carries `invoice_id`, so `customer.subscription.*` events are linked to the invoice.
-- Webhook: `checkout.session.completed` / `async_payment_succeeded` → `mark_invoice_paid`, only if `payment_status` is `paid` (or `no_payment_required`) and `amount_total`/`currency` match the invoice. Otherwise the `payment_mismatch` signal is sent and the invoice stays pending.
-- Subscriptions: `UserEntitlement.active_until` follows `current_period_end` (renewals extend access); `canceled` / `unpaid` / `incomplete_expired` / `paused` revoke access.
-- Cron: `sync_invoice_status()` → `Session.retrieve` → same logic as webhook (`_apply_checkout_session_paid`).
+- Webhook: `checkout.session.completed` / `async_payment_succeeded` → `mark_invoice_paid`, only if `payment_status` is `paid` (or `no_payment_required`) and `amount_total`/`currency` are exactly the invoice amount in Stripe units. A smaller or larger amount sends `payment_mismatch` and leaves the invoice pending.
+- `charge.refunded` and succeeded `refund.updated` write an idempotent ledger debit (`stripe-refund:{refund_id}`). A full refund sets `active_until` to now. Put `invoice_id` in the charge or refund metadata (Checkout copies `payment_intent_data.metadata`).
+- Subscriptions: until the subscription webhook arrives, `month` / `year` entitlements get a provisional `active_until` of 30 or 365 days. `customer.subscription.*` then sets `active_until` from `current_period_end`. `canceled` / `unpaid` / `incomplete_expired` / `paused` revoke access.
+- Cron: provider HTTP runs outside the database transaction; the status write uses a short row lock. Same payment rules as the webhook.
 
 **Webhook setup in Stripe Dashboard:**
 
 - URL: `https://your-domain/billing/webhooks/stripe/`
-- Events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`
+- Events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `charge.refunded`, `refund.updated`
 - Secret → `DJANGO_STRIPE_PLISIO_STRIPE_WEBHOOK_SECRET`
 
 ### Plisio (`PlisioPaymentService`)
@@ -898,8 +901,11 @@ Factory: `payments.services.get_payment_service(provider)` / `create_checkout(in
 - `json=true` is appended to `callback_url`: Plisio sends JSON callbacks signed with `HMAC-SHA1(JSON, secret)`. Form-encoded callbacks (without `json=true`) are verified as `HMAC-SHA1(PHP serialize(ksort(data)), secret)` — as in the [Plisio docs](https://plisio.net/documentation/endpoints/create-an-invoice).
 - If a secret is configured, `verify_hash` is mandatory; comparison is constant-time.
 - The API key is never stored in `PaymentAttempt.error_message` or logs (it is passed in the query string, so errors are redacted).
-- Statuses `completed` / `confirmed` → payment counted; `mismatch` and `expired` with a partial amount → `payment_mismatch` signal (manual review); `expired` / `cancelled` → invoice `expired` / `cancelled`.
-- Cron: `GET /operations/{txn_id}`; `mismatch` does not move invoice to `paid`.
+- Recurring prices (`month` / `year`) are rejected in `create_invoice` with `BillingError`. Plisio invoices are one-time only.
+- Status `completed` counts as paid only when `source_amount` and `source_currency` equal the invoice. `confirmed` is not a paid status. A missing or different amount sends `payment_mismatch` and leaves the invoice `pending`.
+- `mismatch`, and `expired` with a positive crypto `amount`, send `payment_mismatch` and stay `pending` for manual review. `expired` with no amount, and `cancelled`, close the invoice. `error` marks the invoice and the attempt `failed` and sends `payment_failed`. `pending internal` is left `pending` (funds may still be in flight).
+- `return_existing=true` is accepted only when the returned `source_amount` is absent or equal to the invoice. A stale amount fails the attempt.
+- Cron: `GET /operations/{txn_id}` outside the database transaction. `mismatch` and a partial `expired` emit the same `payment_mismatch` signal as the webhook.
 
 **Callback URL in Plisio dashboard:**
 
@@ -1075,27 +1081,18 @@ python manage.py dsp_expire_invoices
 2. **Ledger** — append-only; corrections via a new entry.
 3. **Invoice** — price snapshot in `InvoiceLine`; discount in `InvoiceDiscount`.
 4. **Webhooks** — idempotent; `mark_invoice_paid` safe on retry.
-5. **Plisio** — one-time invoices only, no recurring.
+5. **Plisio** — one-time invoices only. `create_invoice` raises `BillingError` for `month` / `year`.
 6. **DRF** — optional; without it models, admin, services, webhooks work.
-7. **Cron** — `dsp_sync_invoices` before `dsp_expire_invoices`; sync does not cancel sessions at providers.
+7. **Cron** — `dsp_sync_invoices` before `dsp_expire_invoices`. Expire skips invoices that already have a provider id. Sync does not cancel sessions at providers.
 8. **Business logic** — minimal in the package; extend via signals and your handlers.
 
 ---
 
 ## Development and testing
 
-### Demo project
-
-```bash
-pip install -e ".[dev]"
-cd demo_project
-python manage.py migrate
-python manage.py runserver
-```
-
-PyCharm run configurations available: **Demo: runserver**, **Demo: migrate**, **Tests: pytest**.
-
 ### Tests
+
+The repository does not ship a `demo_project` app. Run the package tests (Django settings live in `tests/settings.py`):
 
 ```bash
 pytest tests/ -v
@@ -1115,13 +1112,21 @@ DSP_TEST_DB=postgres POSTGRES_HOST=localhost POSTGRES_DB=dsp_test pytest tests/
 ```
 django-stripe-plisio/
 ├── src/django_stripe_plisio/   # package source
-├── demo_project/               # integration example
 ├── tests/                      # pytest
 ├── pyproject.toml
 └── README.md
 ```
 
 ---
+
+## Publishing
+
+PyPI publish is a GitHub Actions job (`.github/workflows/publish.yml`), not a manual `twine upload`.
+
+1. `pyproject.toml` `version` and `src/django_stripe_plisio/__init__.py` `__version__` are the same value (for this release, `0.5.0`).
+2. Merge the release commit to `main`.
+3. Create a GitHub Release whose tag is `v` plus that version (`v0.5.0`). The workflow reads the tag, checks it against both version files, runs pytest, ruff, and mypy, builds the sdist and wheel, then publishes with [PyPA's trusted publisher](https://docs.pypi.org/trusted-publishers/) (`pypa/gh-action-pypi-publish`, OIDC `id-token: write`).
+4. The PyPI project needs a trusted publisher for this repository, workflow `publish.yml`, and the `publish` environment if one is configured on PyPI. There is no `TWINE_USERNAME` / API token in the workflow.
 
 ## License
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+### Fixed
+
+- Plisio `completed` зачисляется только если `source_amount` и `source_currency` совпадают со счётом. Меньшая, большая или пустая сумма → `payment_mismatch`, счёт остаётся `pending`.
+- `return_existing` больше не привязывает старый инвойс Plisio с другой суммой: попытка сохраняется как `failed`.
+- `mismatch` и `expired` с положительным `amount` не закрывают счёт молча: `payment_mismatch`, `ProviderTransaction` с сырым callback. В `expired` переводится только нулевая сумма.
+- Plisio `error` переводит счёт и попытку в `failed` и шлёт `payment_failed`. `pending internal` счёт не трогает.
+- Локальный TTL (`expire_pending_invoices`) не истекает счета с непустым `external_id`. Их закрывает sync после ответа провайдера.
+- Фиксированная скидка без `fixed_currency` или с другой валютой не применяется (`BillingError` при создании счёта).
+- Stripe: оплата только при точном равенстве `amount_total` и валюты. Переплата — `payment_mismatch`, не `paid`.
+- Stripe: `UGX` (и `ISK` в нулевых единицах пакета) передаётся в единицах Stripe (`×100`). Трёхзначные валюты с ненулевым последним знаком отклоняются.
+- `Price.stripe_price_id` сверяется со Stripe Price (`unit_amount`, `currency`) до создания сессии.
+- `charge.refunded` / `refund.updated`: идемпотентное списание в ledger (`reference=stripe-refund:{id}`). Полный возврат снимает доступ (`active_until=now`).
+- HTTP к Stripe и Plisio не держит `select_for_update`. Запись попытки и статуса — короткая транзакция после ответа; ошибка БД одного счёта в sync не ломает остальные.
+
+### Changed
+
+- Plisio и цена `month`/`year`: `create_invoice` поднимает `BillingError`. Рекуррент только через Stripe.
+- `mark_invoice_paid` для `month`/`year` ставит `UserEntitlement.active_until` на 30 или 365 дней. Webhook подписки Stripe по-прежнему заменяет его на `current_period_end`.
+- Статус Plisio `confirmed` больше не считается оплатой. Оплата — только `completed` с совпавшей суммой.
+- Пустые `SUCCESS_URL` / `CANCEL_URL` не подменяются на `example.com`. Для Stripe Checkout обе настройки обязательны (`ImproperlyConfigured`).
+- `WebhookEvent.invoice` и `WebhookEvent.payment_attempt` заполняются, когда обработчик их определил.
+- `project.license` — SPDX-строка `"MIT"`.
+
 ## 0.4.0
 
 ### Security

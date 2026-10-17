@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
@@ -13,9 +13,7 @@ from django.utils import timezone
 from django_stripe_plisio.billing.models import Invoice
 from django_stripe_plisio.payments.enums import WebhookProcessingStatus
 from django_stripe_plisio.payments.models import PaymentAttempt, WebhookEvent
-
-if TYPE_CHECKING:
-    from django_stripe_plisio.payments.sync_types import InvoiceSyncOutcome
+from django_stripe_plisio.payments.sync_types import InvoiceSyncOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +38,24 @@ class BasePaymentProvider(ABC):
         """Обработать событие webhook."""
 
     @abstractmethod
+    def load_remote_invoice_state(self, invoice: Invoice) -> Any:
+        """HTTP к провайдеру без транзакции. Может вернуть ``InvoiceSyncOutcome``."""
+
+    @abstractmethod
+    def apply_remote_invoice_state(self, invoice: Invoice, remote: Any) -> InvoiceSyncOutcome:
+        """Записать уже полученный статус. Вызывается внутри короткой транзакции."""
+
     def sync_invoice_status(self, invoice: Invoice) -> InvoiceSyncOutcome:
-        """Опросить провайдера и обновить статус счёта."""
+        """Опросить провайдера и обновить статус счёта.
+
+        Сетевой вызов снаружи транзакции, запись статуса — под блокировкой строки.
+        """
+        remote = self.load_remote_invoice_state(invoice)
+        if isinstance(remote, InvoiceSyncOutcome):
+            return remote
+        with transaction.atomic():
+            current = Invoice.objects.select_for_update().get(pk=invoice.pk)
+            return self.apply_remote_invoice_state(current, remote)
 
     def _process_webhook(
         self,
@@ -70,9 +84,17 @@ class BasePaymentProvider(ABC):
                 if locked.status == WebhookProcessingStatus.PROCESSED:
                     return
                 locked.status = handler()
+                invoice, attempt = self._webhook_subject(payload)
+                update_fields = ["status", "processed_at", "error_message"]
+                if invoice is not None:
+                    locked.invoice = invoice
+                    update_fields.append("invoice")
+                if attempt is not None:
+                    locked.payment_attempt = attempt
+                    update_fields.append("payment_attempt")
                 locked.processed_at = timezone.now()
                 locked.error_message = ""
-                locked.save(update_fields=["status", "processed_at", "error_message"])
+                locked.save(update_fields=update_fields)
         except Exception as exc:
             WebhookEvent.objects.filter(pk=webhook.pk).update(
                 status=WebhookProcessingStatus.FAILED,
@@ -80,6 +102,13 @@ class BasePaymentProvider(ABC):
             )
             logger.exception("%s webhook processing failed (%s)", self.provider, idempotency_key)
             raise
+
+    def _webhook_subject(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[Invoice | None, PaymentAttempt | None]:
+        """Счёт и попытка, к которым относится уже обработанный webhook."""
+        return None, None
 
     def _latest_attempt(
         self,

@@ -163,14 +163,20 @@ def test_sync_isolates_db_error_per_invoice(user, price, settings):
     second = create_invoice(user, price, provider=PaymentProvider.PLISIO)
     Invoice.objects.filter(pk__in=[first.pk, second.pk]).update(external_id="txn")
 
-    def fake_sync(self, invoice):
+    def fake_load(self, invoice):
+        return {"status": "completed"}
+
+    def fake_apply(self, invoice, remote):
         if invoice.pk == first.pk:
             # Ошибка БД внутри обработки одного счёта
             Invoice.objects.create(user=None, provider="plisio", currency="USD")
         mark_invoice_paid(invoice)
         return InvoiceSyncOutcome.PAID
 
-    with patch.object(PlisioPaymentService, "sync_invoice_status", fake_sync):
+    with (
+        patch.object(PlisioPaymentService, "load_remote_invoice_state", fake_load),
+        patch.object(PlisioPaymentService, "apply_remote_invoice_state", fake_apply),
+    ):
         result = sync_pending_invoices()
 
     second.refresh_from_db()

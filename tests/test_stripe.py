@@ -3,13 +3,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import stripe
+from django.core.exceptions import ImproperlyConfigured
 from django.test import Client
 from django.utils import timezone
 
 from django_stripe_plisio.billing.enums import DiscountType, InvoiceStatus, PaymentProvider
 from django_stripe_plisio.billing.models import Price, PromoCode, UserEntitlement
-from django_stripe_plisio.billing.services import create_invoice
-from django_stripe_plisio.exceptions import PaymentProviderError
+from django_stripe_plisio.billing.services import (
+    create_invoice,
+    get_user_balance,
+    mark_invoice_paid,
+)
+from django_stripe_plisio.exceptions import BillingError, PaymentProviderError
 from django_stripe_plisio.payments.enums import (
     PaymentAttemptStatus,
     StripeSubscriptionStatus,
@@ -22,6 +27,7 @@ from django_stripe_plisio.signals import payment_mismatch
 
 STRIPE = "django_stripe_plisio.payments.services.stripe_service.stripe"
 SESSION_CREATE = f"{STRIPE}.checkout.Session.create"
+PRICE_RETRIEVE = f"{STRIPE}.Price.retrieve"
 SESSION_RETRIEVE = f"{STRIPE}.checkout.Session.retrieve"
 COUPON_CREATE = f"{STRIPE}.Coupon.create"
 
@@ -60,7 +66,11 @@ def test_stripe_price_id_uses_real_quantity(user, price):
     price.save()
     invoice = create_invoice(user, price, provider=PaymentProvider.STRIPE, quantity=3)
 
-    with patch(SESSION_CREATE, return_value=_session()) as mock_create:
+    remote_price = {"id": "price_123", "unit_amount": 1000, "currency": "usd"}
+    with (
+        patch(SESSION_CREATE, return_value=_session()) as mock_create,
+        patch(PRICE_RETRIEVE, return_value=remote_price),
+    ):
         create_checkout(invoice)
 
     assert mock_create.call_args.kwargs["line_items"] == [{"price": "price_123", "quantity": 3}]
@@ -87,6 +97,7 @@ def test_subscription_discount_is_one_time_coupon(user, monthly_price):
         code="FIRST",
         discount_type=DiscountType.FIXED,
         fixed_amount_minor=500,
+        fixed_currency="USD",
     )
     invoice = create_invoice(
         user,
@@ -302,3 +313,56 @@ def test_subscription_lifecycle_updates_entitlement(user, monthly_price):
     assert subscription.status == StripeSubscriptionStatus.CANCELED
     assert entitlement.active_until <= timezone.now()
     assert entitlement.is_active is False
+
+
+@pytest.mark.django_db
+def test_checkout_requires_redirect_urls(user, price, settings):
+    settings.DJANGO_STRIPE_PLISIO_SUCCESS_URL = ""
+    settings.DJANGO_STRIPE_PLISIO_CANCEL_URL = ""
+    invoice = create_invoice(user, price, provider=PaymentProvider.STRIPE)
+    with pytest.raises(ImproperlyConfigured):
+        create_checkout(invoice)
+
+
+@pytest.mark.django_db
+def test_stripe_price_id_mismatch_is_rejected(user, price):
+    price.stripe_price_id = "price_other"
+    price.save()
+    invoice = create_invoice(user, price, provider=PaymentProvider.STRIPE)
+    remote_price = {"id": "price_other", "unit_amount": 1, "currency": "usd"}
+    with (
+        patch(PRICE_RETRIEVE, return_value=remote_price),
+        patch(SESSION_CREATE) as mock_create,
+        pytest.raises(BillingError, match="does not match"),
+    ):
+        create_checkout(invoice)
+    mock_create.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_charge_refunded_debits_ledger_and_ends_access(user, price):
+    invoice = create_invoice(user, price, provider=PaymentProvider.STRIPE)
+    mark_invoice_paid(invoice)
+    assert get_user_balance(user, "USD") == 1000
+
+    charge = {
+        "id": "ch_1",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "currency": "usd",
+        "metadata": {"invoice_id": str(invoice.pk)},
+        "refunds": {"data": [{"id": "re_1", "amount": 1000, "status": "succeeded"}]},
+    }
+    service = StripePaymentService()
+    service.handle_webhook_event(
+        {"id": "evt_ref", "type": "charge.refunded", "data": {"object": charge}},
+    )
+    service.handle_webhook_event(
+        {"id": "evt_ref_2", "type": "charge.refunded", "data": {"object": charge}},
+    )
+
+    assert get_user_balance(user, "USD") == 0
+    entitlement = UserEntitlement.objects.get(invoice=invoice)
+    assert entitlement.is_active is False
+    webhook = WebhookEvent.objects.get(idempotency_key="stripe:evt_ref")
+    assert webhook.invoice_id == invoice.pk
