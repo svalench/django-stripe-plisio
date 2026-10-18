@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import time
+from urllib.parse import urlencode
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -98,3 +99,54 @@ def test_plisio_verify_rejects_without_secret():
     service = PlisioPaymentService()
     with pytest.raises(WebhookVerificationError):
         service._verify_plisio_data({"status": "completed", "verify_hash": "abc"})
+
+
+@pytest.mark.parametrize("verify_hash", ["é" * 40, "🔒", 123, ["abc"], {"hash": "abc"}])
+@pytest.mark.parametrize("content_type", ["application/json", "application/x-www-form-urlencoded"])
+def test_plisio_malformed_signature_returns_bad_request(verify_hash, content_type):
+    payload = {"status": "completed", "verify_hash": verify_hash}
+    data = json.dumps(payload) if content_type == "application/json" else urlencode(payload)
+    response = Client().post(
+        "/billing/webhooks/plisio/", data=data, content_type=content_type
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("source_amount", ["sNaN", "Infinity", "1e999999999", "-1"])
+def test_plisio_signed_invalid_amount_is_recorded_for_review(pending_invoice, source_amount):
+    from django_stripe_plisio.payments.models import ProviderTransaction
+    from django_stripe_plisio.payments.services.plisio_service import json_signature_base
+
+    pending_invoice.provider = PaymentProvider.PLISIO
+    pending_invoice.save(update_fields=["provider"])
+    payload = {
+        "txn_id": "txn_invalid_amount",
+        "order_number": str(pending_invoice.pk),
+        "status": "completed",
+        "source_currency": "USD",
+        "source_amount": source_amount,
+    }
+    payload["verify_hash"] = hmac.new(
+        b"plisio_test_secret", json_signature_base(payload).encode(), hashlib.sha1
+    ).hexdigest()
+    response = Client().post(
+        "/billing/webhooks/plisio/", data=json.dumps(payload), content_type="application/json"
+    )
+    assert response.status_code == 200
+    pending_invoice.refresh_from_db()
+    assert pending_invoice.status == InvoiceStatus.PENDING
+    transaction = ProviderTransaction.objects.get(invoice=pending_invoice)
+    assert transaction.amount_minor == 0
+    assert transaction.status == "amount_mismatch"
+
+
+@pytest.mark.parametrize("payload", [
+    json.dumps({"verify_hash": "a" * 40, "status": "\ud800"}),
+    "[" * 2000 + "0" + "]" * 2000,
+])
+def test_plisio_malformed_json_text_returns_bad_request(payload):
+    response = Client().post(
+        "/billing/webhooks/plisio/", data=payload, content_type="application/json"
+    )
+    assert response.status_code == 400

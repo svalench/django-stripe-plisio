@@ -239,7 +239,7 @@ class PlisioPaymentService(BasePaymentProvider):
         """Проверка JSON-callback (``callback_url`` с ``json=true``)."""
         try:
             data = json.loads(payload)
-        except (ValueError, UnicodeDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
             raise WebhookVerificationError("Invalid Plisio callback payload") from exc
         if not isinstance(data, dict):
             raise WebhookVerificationError("Invalid Plisio callback payload")
@@ -266,12 +266,15 @@ class PlisioPaymentService(BasePaymentProvider):
             return payload
 
         # Секрет задан — подпись обязательна независимо от REQUIRE_WEBHOOK_SECRET
-        if not verify_hash:
+        if not isinstance(verify_hash, str) or not verify_hash:
             raise WebhookVerificationError("Missing Plisio verify_hash")
 
-        base = php_signature_base(payload) if form_encoded else json_signature_base(payload)
-        expected = hmac.new(secret.encode(), base.encode(), hashlib.sha1).hexdigest()
-        if not hmac.compare_digest(expected, str(verify_hash)):
+        try:
+            base = php_signature_base(payload) if form_encoded else json_signature_base(payload)
+            expected = hmac.new(secret.encode(), base.encode(), hashlib.sha1).hexdigest()
+        except (ValueError, RecursionError) as exc:
+            raise WebhookVerificationError("Invalid Plisio callback payload") from exc
+        if not verify_hash.isascii() or not hmac.compare_digest(expected, verify_hash):
             raise WebhookVerificationError("Invalid Plisio callback signature")
         return payload
 

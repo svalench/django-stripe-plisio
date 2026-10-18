@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         django-version: ["5.2", "6.0"]
         database: ["postgres"]
         exclude:
@@ -79,7 +79,7 @@ jobs:
         run: pip install -e ".[dev]" "Django~=${{ matrix.django-version }}.0"
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v --cov=django_stripe_plisio --cov-branch --cov-report=term-missing
 
   build:
     runs-on: ubuntu-latest
@@ -98,6 +98,19 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+      - name: Install wheel with optional integrations
+        run: |
+          python - <<'PYCODE'
+          import pathlib
+          import subprocess
+          wheel = next(pathlib.Path("dist").glob("*.whl")).resolve()
+          subprocess.run([
+              "python", "-m", "pip", "install",
+              f"django-stripe-plisio[api,cron] @ {wheel.as_uri()}",
+          ], check=True)
+          subprocess.run(["python", "-m", "pip", "check"], check=True)
+          PYCODE
 
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4

@@ -27,3 +27,20 @@ def test_usd_stripe_amount_is_unchanged():
 def test_three_decimal_stripe_amount_must_end_with_zero():
     assert stripe_amount_is_representable(1000, "KWD") is True
     assert stripe_amount_is_representable(1001, "KWD") is False
+
+
+def test_invalid_provider_amounts_are_rejected():
+    from django_stripe_plisio.billing.money import major_amount_matches, major_to_minor_amount
+
+    for value in ("NaN", "sNaN", "Infinity", "-Infinity", "1e999999999", "-1"):
+        assert major_amount_matches(value, 100, "USD") is False
+        assert major_to_minor_amount(value, "USD") is None
+
+
+def test_provider_amount_database_boundary():
+    from django_stripe_plisio.billing.money import major_to_minor_amount
+
+    assert major_to_minor_amount("92233720368547758.07", "USD") == 2**63 - 1
+    assert major_to_minor_amount("92233720368547758.08", "USD") is None
+    assert major_to_minor_amount("0", "USD") == 0
+    assert major_to_minor_amount("0.001", "USD") is None

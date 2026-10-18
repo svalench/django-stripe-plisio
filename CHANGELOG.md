@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- Plisio callbacks with non-ASCII or non-string signatures now return HTTP 400 instead of raising an unhandled verification error.
+- Non-finite, negative and out-of-range provider amounts are rejected safely and recorded for review without crediting invoices or overflowing database amounts.
+- The `cron` extra now requires the available `django-crontab>=0.7.1`, fixing an unsatisfiable dependency on a nonexistent 2.4 release.
+
+### Security
+
+- Pass the release tag through an environment variable before shell version validation, avoiding evaluation of tag content as shell code.
+
 ## 0.5.0
 
 ### Fixed

@@ -81,7 +81,7 @@ def major_amount_matches(raw_amount: object, amount_minor: int, currency: str) -
         paid = Decimal(str(raw_amount))
     except (InvalidOperation, ValueError):
         return False
-    return paid == Decimal(minor_to_major_amount(amount_minor, currency))
+    return paid.is_finite() and paid == Decimal(minor_to_major_amount(amount_minor, currency))
 
 
 def major_to_minor_amount(raw_amount: object, currency: str) -> int | None:
@@ -92,7 +92,12 @@ def major_to_minor_amount(raw_amount: object, currency: str) -> int | None:
         major = Decimal(str(raw_amount))
     except (InvalidOperation, ValueError):
         return None
-    scaled = major * (Decimal(10) ** currency_exponent(currency))
+    # ProviderTransaction.amount_minor is a database PositiveBigIntegerField.
+    # Bound before arithmetic/int conversion to reject non-finite and huge exponents.
+    exponent = currency_exponent(currency)
+    if not major.is_finite() or not 0 <= major <= Decimal(2**63 - 1).scaleb(-exponent):
+        return None
+    scaled = major * (Decimal(10) ** exponent)
     integral = scaled.to_integral_value()
     if scaled != integral:
         return None
